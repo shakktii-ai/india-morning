@@ -1,18 +1,27 @@
-import { executeDailyMorningNewsCron, fetchDailyMorningNews, saveMorningNewsToFirestore } from "@/src/lib/serpapi";
+import {
+  executeDailyMorningNewsCron,
+  fetchDailyMorningNews,
+  saveMorningNewsToFirestore,
+  publishNewsToLiveArticles,
+} from "@/src/lib/serpapi";
 import { jsonError, jsonOk } from "@/src/utils/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300; // Allow full 5-minute execution window for live article publishing
 
 /**
  * Handler for the SerpAPI Daily Morning News Cron Job
- * Scheduled to run every morning at 8:00 AM.
+ * Scheduled to run every morning at 8:00 AM (8:00 AM IST = 02:30 UTC).
  */
 async function handleCronRequest(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const secret = req.headers.get("x-cron-secret") || searchParams.get("secret");
-    const isVercelCron = req.headers.get("x-vercel-cron") === "1";
+    const authHeader = req.headers.get("authorization") || "";
+    const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    const secret = req.headers.get("x-cron-secret") || bearerToken || searchParams.get("secret");
+    const userAgent = req.headers.get("user-agent") || "";
+    const isVercelCron = req.headers.get("x-vercel-cron") === "1" || userAgent.includes("vercel-cron");
 
     // Security check matching the project's cron convention
     if (process.env.CRON_SECRET) {
@@ -34,14 +43,17 @@ async function handleCronRequest(req: Request) {
         return jsonError(fetchRes.error || "Failed to fetch news from SerpAPI", 500);
       }
       const saveRes = await saveMorningNewsToFirestore(fetchRes);
+      // Auto-publish to live articles collection
+      const pubRes = await publishNewsToLiveArticles(fetchRes.articles);
       result = {
         success: true,
-        count: saveRes.savedCount,
-        message: saveRes.message,
+        count: saveRes.savedCount + pubRes.publishedCount,
+        message: `${saveRes.message}. Published ${pubRes.publishedCount} stories to live site.`,
         timestamp: new Date().toISOString(),
         articles: fetchRes.articles,
       };
     } else {
+      // Complete automated morning cron workflow: fetches morning digest + discovers all categories + auto-publishes to live site
       result = await executeDailyMorningNewsCron();
     }
 

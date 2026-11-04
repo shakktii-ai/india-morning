@@ -534,6 +534,53 @@ export function getCategorySearchQuery(name: string, slug: string): string {
 }
 
 /**
+ * Automatically infers the most relevant category based on keywords in title & snippet
+ */
+export async function inferCategory(
+  title: string,
+  snippet: string = ""
+): Promise<{ id: string; name: string; slug: string } | null> {
+  const text = `${title} ${snippet}`.toLowerCase();
+
+  const rules: { keywords: string[]; slug: string }[] = [
+    { keywords: ["cricket", "match", "wicket", "tournament", "ipl", "odi", "t20", "score", "batsman", "bowler", "athletics", "football", "hockey", "sports", "coach"], slug: "sports" },
+    { keywords: ["sensex", "nifty", "stock", "shares", "rbi", "inflation", "market", "gdp", "rupee", "bank", "investor", "revenue", "fiscal", "economy", "business"], slug: "business" },
+    { keywords: ["police", "arrest", "murder", "fir", "crime", "custody", "gangster", "cbi", "ed", "fraud", "scam", "smuggling", "encounter"], slug: "crime" },
+    { keywords: ["bollywood", "movie", "film", "actor", "actress", "box office", "trailer", "cinema", "ott", "entertainment"], slug: "entertainment" },
+    { keywords: ["hospital", "patient", "doctor", "health", "disease", "wellness", "medical", "surgery", "cancer", "vaccine", "dhanteras"], slug: "health" },
+    { keywords: ["rain", "monsoon", "cyclone", "temperature", "forecast", "weather", "imd", "heatwave", "delhi air", "pollution"], slug: "weather" },
+    { keywords: ["school", "college", "exam", "student", "cbse", "university", "neet", "jee", "education", "teacher", "academic"], slug: "education" },
+    { keywords: ["horoscope", "rashifal", "zodiac", "astrology", "astrological"], slug: "rashi-bhavishya" },
+    { keywords: ["temple", "puja", "dharma", "spiritual", "bhakti", "astha", "prasad", "deity"], slug: "astha" },
+    { keywords: ["election", "bjp", "congress", "vote", "poll", "minister", "parliament", "rahul gandhi", "modi", "politics", "cabinet", "mla", "mp"], slug: "politices" },
+    { keywords: ["mumbai", "bmc", "borivali", "dadar", "thane"], slug: "mumbai" },
+    { keywords: ["pune", "pmc"], slug: "pune" },
+    { keywords: ["nashik"], slug: "nashik" },
+    { keywords: ["vidarbha", "nagpur"], slug: "vidharbha" },
+    { keywords: ["maharashtra", "mantralaya", "fadnavis", "shinde", "thackeray"], slug: "maharashtra" },
+  ];
+
+  for (const rule of rules) {
+    if (rule.keywords.some((kw) => text.includes(kw))) {
+      const snap = await db.collection("categories").where("slug", "==", rule.slug).limit(1).get();
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
+      }
+    }
+  }
+
+  // Fallback to "national" or "news"
+  const natSnap = await db.collection("categories").where("slug", "in", ["national", "news"]).limit(1).get();
+  if (!natSnap.empty) {
+    const doc = natSnap.docs[0];
+    return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
+  }
+
+  return null;
+}
+
+/**
  * Retrieves the set of all dismissed article IDs to guarantee they never reappear
  */
 export async function getDismissedIdsSet(): Promise<Set<string>> {
@@ -932,6 +979,13 @@ export async function publishArticleToLive(
       if (!catSnap.empty) {
         categoryId = catSnap.docs[0].id;
       }
+    }
+  }
+
+  if (!categoryId) {
+    const inferred = await inferCategory(art.title, art.snippet || "");
+    if (inferred) {
+      categoryId = inferred.id;
     }
   }
 
