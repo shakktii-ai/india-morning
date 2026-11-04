@@ -1,6 +1,7 @@
 import { db } from "@/src/lib/firebase-admin";
 import { slugify } from "@/src/utils/slug";
 import { generateSearchKeywords } from "@/src/utils/taxonomy";
+import { extractFullArticleContent } from "@/src/lib/article-extractor";
 
 export interface SerpApiSource {
   name: string;
@@ -33,6 +34,7 @@ export interface DiscoveredNewsArticle extends SerpApiNewsArticle {
   draftArticleId?: string | null;
   publishedArticleId?: string | null;
   isLivePublished?: boolean;
+  contentHtml?: string;
 }
 
 export interface SerpApiNewsOptions {
@@ -611,8 +613,27 @@ export async function discoverNewsForCategory(
       continue;
     }
 
+    let leadImage: string | null = null;
+    let fullExcerpt: string | undefined = undefined;
+    let fullContentHtml: string | undefined = undefined;
+
+    try {
+      const extracted = await extractFullArticleContent(art.link, {
+        fallbackTitle: art.title,
+        fallbackSnippet: art.snippet,
+        sourceName: art.source?.name,
+        timeoutMs: 4000,
+      });
+      leadImage = extracted.leadImage || null;
+      fullExcerpt = extracted.excerpt;
+      fullContentHtml = extracted.contentHtml;
+    } catch (e) {}
+
     const discoveredArt: DiscoveredNewsArticle = {
       ...art,
+      snippet: fullExcerpt || art.snippet,
+      thumbnailUrl: art.thumbnailUrl || leadImage || null,
+      contentHtml: fullContentHtml,
       categoryId: category.id,
       categoryName: category.name,
       categorySlug: category.slug,
@@ -815,26 +836,31 @@ export async function convertDiscoveredToDraft(
 
   const searchKeywords = generateSearchKeywords([data.title, data.snippet || ""]);
 
-  const contentHtml = `
-    <p><strong>${data.title}</strong></p>
-    <p>${data.snippet || ""}</p>
-    <p><em>Discovered via ${data.source?.name || "News Source"}. Original source: <a href="${data.link}" target="_blank" rel="noopener noreferrer">${data.link}</a></em></p>
-  `.trim();
+  // Extract full rich article content from the original publisher URL
+  const extracted = await extractFullArticleContent(data.link, {
+    fallbackTitle: data.title,
+    fallbackSnippet: data.snippet,
+    sourceName: data.source?.name,
+  });
+
+  const contentHtml = extracted.contentHtml;
+  const excerpt = extracted.excerpt || data.snippet || null;
+  const coverImageUrl = data.thumbnailUrl || extracted.leadImage || null;
 
   const newArticle = {
     title: data.title,
     slug,
     searchKeywords,
-    excerpt: data.snippet || null,
+    excerpt,
     contentHtml,
-    coverImageUrl: data.thumbnailUrl || null,
+    coverImageUrl,
     language: "EN",
     region: "MAHARASHTRA",
     categoryIds: data.categoryId ? [data.categoryId] : [],
     categoryId: data.categoryId || null,
     authorId: actor.id,
     seoTitle: data.title,
-    metaDescription: data.snippet || null,
+    metaDescription: excerpt,
     canonicalUrl: data.link || null,
     tagIds: [],
     status: "DRAFT",
@@ -944,27 +970,31 @@ export async function publishArticleToLive(
   const publishedAt = art.isoDate || now;
   const sourceName = art.source?.name || "India Morning News Desk";
 
-  const contentHtml = `
-    <p style="font-size: 1.15rem; line-height: 1.6; margin-bottom: 1rem; font-weight: 500;">${art.snippet || art.title}</p>
-    <p style="margin-bottom: 1rem;">Stay tuned to <strong>India Morning</strong> for continuous real-time updates and ongoing developments on this story.</p>
-    <hr style="margin: 1.5rem 0; border: none; border-top: 1px solid #e5e7eb;" />
-    <p style="font-size: 0.875rem; color: #6b7280;"><em>Discovered via ${sourceName}. Read original reporting: <a href="${art.link}" target="_blank" rel="noopener noreferrer" style="color: #4f46e5; text-decoration: underline;">${art.link}</a></em></p>
-  `.trim();
+  // Extract full rich article content from the original publisher URL
+  const extracted = await extractFullArticleContent(art.link, {
+    fallbackTitle: art.title,
+    fallbackSnippet: art.snippet,
+    sourceName,
+  });
+
+  const contentHtml = extracted.contentHtml;
+  const excerpt = extracted.excerpt || art.snippet || art.title;
+  const coverImageUrl = art.thumbnailUrl || extracted.leadImage || null;
 
   const newArticle = {
     title: art.title,
     slug,
     searchKeywords,
-    excerpt: art.snippet || art.title,
+    excerpt,
     contentHtml,
-    coverImageUrl: art.thumbnailUrl || null,
+    coverImageUrl,
     language: "EN",
     region: "MAHARASHTRA",
     categoryIds: categoryId ? [categoryId] : [],
     categoryId: categoryId || null,
     authorId,
     seoTitle: art.title,
-    metaDescription: art.snippet || art.title,
+    metaDescription: excerpt,
     focusKeyphrase: art.title.split(" ").slice(0, 4).join(" "),
     canonicalUrl: art.link || null,
     tagIds: [],

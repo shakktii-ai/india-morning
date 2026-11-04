@@ -30,6 +30,7 @@ interface DiscoveredArticle {
   draftArticleId?: string | null;
   publishedArticleId?: string | null;
   isLivePublished?: boolean;
+  contentHtml?: string;
 }
 
 export default function NewsDiscoveryPage() {
@@ -1218,12 +1219,16 @@ export default function NewsDiscoveryPage() {
               <span>Published: {previewArticle.publishedAt || "Recently"}</span>
             </div>
 
-            {/* Full snippet */}
-            <div style={{ background: "#f9fafb", borderRadius: 10, padding: 16, marginBottom: 20, fontSize: 14, lineHeight: 1.6, color: "#374151" }}>
-              <div style={{ fontWeight: 600, fontSize: 12, color: "#6b7280", marginBottom: 6, textTransform: "uppercase" }}>
-                Story Excerpt / Snippet
+            {/* Full Story Content / Snippet */}
+            <div style={{ background: "#f9fafb", borderRadius: 10, padding: 18, marginBottom: 20, fontSize: 14, lineHeight: 1.7, color: "#374151", maxHeight: 350, overflowY: "auto" }}>
+              <div style={{ fontWeight: 700, fontSize: 12, color: "#4f46e5", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                Full Article Content
               </div>
-              {previewArticle.snippet || "No additional excerpt available."}
+              {previewArticle.contentHtml ? (
+                <div dangerouslySetInnerHTML={{ __html: previewArticle.contentHtml }} />
+              ) : (
+                <p>{previewArticle.snippet || "No additional excerpt available."}</p>
+              )}
             </div>
 
             {/* Original Link */}
