@@ -1,0 +1,16 @@
+name: Daily SerpAPI News Cron
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # Every morning at 8:00 AM IST (02:30 UTC)
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+
+jobs:
+  fetch-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Daily SerpAPI News Cron
+        run: |
+          curl --fail -X GET "https://indiamorning.in/api/cron/serpapi-news" \
+               -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"
+

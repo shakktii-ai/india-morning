@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<advads-export>
+  <groups type="array"/>
+  <options type="array">
+    <advanced-ads-adsense type="array">
+      <background type="boolean">0</background>
+      <page-level-enabled type="boolean">1</page-level-enabled>
+      <adsense-id type="string">pub-7831391181692806</adsense-id>
+    </advanced-ads-adsense>
+    <advanced_ads_ads_txt type="array">
+      <enabled type="boolean">1</enabled>
+      <all_network type="boolean">0</all_network>
+      <custom type="string"></custom>
+      <networks type="array">
+        <adsense type="array">
+          <rec type="string">google.com, pub-7831391181692806, DIRECT, f08c47fec0942fa0</rec>
+        </adsense>
+      </networks>
+    </advanced_ads_ads_txt>
+  </options>
+</advads-export>

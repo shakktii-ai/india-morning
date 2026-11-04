@@ -1,0 +1,15 @@
+name: Publish Scheduled Articles
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Every 15 minutes
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Vercel API
+        run: |
+          curl --fail -X GET "https://indiamorning.in/api/cron/publish-scheduled" \
+               -H "x-cron-secret: ${{ secrets.CRON_SECRET }}"

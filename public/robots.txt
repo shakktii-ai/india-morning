@@ -1,0 +1,68 @@
+User-agent: *
+Allow: /
+
+User-agent: AmazonAdBot
+Allow: /
+User-agent: Googlebot-News
+Allow: /
+
+Disallow: /wp-includes/
+Disallow: /wp-login.php
+Disallow: /wp-admin/
+Disallow: /wp-content/plugins/
+Disallow: /wp-json/wp/v2/
+Disallow: /wp-json/wp/v2/*
+Disallow: /search/
+Disallow: /search?s*
+Disallow: /search/page-*
+Disallow: /abp-widget/
+Disallow: /adsunits/
+
+
+User-agent: ClaudeBot
+Disallow: /
+User-agent: Claude-Web
+Disallow: /
+User-agent: anthropic-ai
+Disallow: /
+User-agent: PerplexityBot
+Disallow: /
+User-agent: pplx-crawler
+Disallow: /
+User-agent: Meta-ExternalAgent
+Disallow: /
+User-agent: Meta-ExternalFetcher
+Disallow: /
+User-agent: Bytespider
+Disallow: /
+User-agent: Applebot-Extended
+Disallow: /
+User-agent: cohere-ai
+Disallow: /
+User-agent: Diffbot
+Disallow: /
+User-agent: omgili
+Disallow: /
+User-agent: omgilibot
+Disallow: /
+User-agent: MAZBot
+Disallow: /
+User-agent: img2dataset
+Disallow: /
+User-agent: FriendlyCrawler
+Disallow: /
+User-agent: Timpibot
+Disallow: /
+User-agent: VelenPublicWebCrawler
+Disallow: /
+
+Disallow: /dajax/
+Disallow: /embed-video-player/
+Disallow: /akamai/
+Disallow: /embed/
+Disallow: /style.css
+
+
+
+Allow:/wp-admin/admin-ajax.php
+Sitemap: https://www.indiamorning.in/sitemap.xml

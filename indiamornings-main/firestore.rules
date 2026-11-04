@@ -1,0 +1,113 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['ADMIN', 'SUPER_ADMIN'];
+    }
+    
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN';
+    }
+    
+    function isJournalist() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['JOURNALIST', 'ADMIN', 'SUPER_ADMIN'];
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Users Collection
+    match /users/{userId} {
+      // Only admins can create users (via server-side API)
+      allow create: if false; // Server-side only via Admin SDK
+      
+      // Users can read their own data, admins can read all
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Only super admins can update user roles and status
+      allow update: if isSuperAdmin();
+      
+      // Only super admins can delete users
+      allow delete: if isSuperAdmin();
+    }
+    
+    // Articles Collection
+    match /articles/{articleId} {
+      // Journalists can create articles
+      allow create: if isJournalist();
+      
+      // Published articles are public, others require authentication
+      allow read: if resource.data.status == 'PUBLISHED' || isJournalist();
+      
+      // Authors can update their own drafts, admins can update all
+      allow update: if (isJournalist() && resource.data.authorId == request.auth.uid) || isAdmin();
+      
+      // Only admins can delete articles
+      allow delete: if isAdmin();
+    }
+    
+    // Categories Collection
+    match /categories/{categoryId} {
+      // Public read access
+      allow read: if true;
+      
+      // Only admins can create, update, or delete categories
+      allow create, update, delete: if isAdmin();
+    }
+    
+    // Tags Collection
+    match /tags/{tagId} {
+      // Public read access
+      allow read: if true;
+      
+      // Only admins can create, update, or delete tags
+      allow create, update, delete: if isAdmin();
+    }
+    
+    // Refresh Tokens Collection
+    match /refresh_tokens/{tokenId} {
+      // Server-side only - no client access
+      allow read, write: if false;
+    }
+    
+    // Audit Logs Collection
+    match /audit_logs/{logId} {
+      // Server-side only - no client access for writes
+      allow create: if false;
+      
+      // Only super admins can read audit logs
+      allow read: if isSuperAdmin();
+      
+      // No updates or deletes allowed
+      allow update, delete: if false;
+    }
+    
+    // System Configs Collection
+    match /system_configs/{configId} {
+      // Public read for configs like AdSense
+      allow read: if true;
+      
+      // Only super admins can modify system configs
+      allow create, update, delete: if isSuperAdmin();
+    }
+    
+    // Default deny all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
