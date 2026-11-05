@@ -31,21 +31,34 @@ interface DiscoveredArticle {
   publishedArticleId?: string | null;
   isLivePublished?: boolean;
   contentHtml?: string;
+  language?: "MR" | "EN";
+  wordCount?: number;
+  isMultiSourceVerified?: boolean;
+  sourceUrls?: { name: string; url: string }[];
+  keyFacts?: string[];
 }
 
 export default function NewsDiscoveryPage() {
   const [articles, setArticles] = useState<DiscoveredArticle[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
+  const [publisherCounts, setPublisherCounts] = useState<Record<string, number>>({});
   const [statusCounts, setStatusCounts] = useState({
     discovered: 0,
     dismissed: 0,
     converted: 0,
     total: 0,
   });
+  const [usageInfo, setUsageInfo] = useState<{
+    callsToday: number;
+    maxDailyLimit: number;
+    remainingCalls: number;
+  } | null>(null);
 
   // Filters & State
   const [selectedCategory, setSelectedCategory] = useState<string>("ALL");
+  const [selectedPublisher, setSelectedPublisher] = useState<string>("ALL");
+  const [selectedLanguage, setSelectedLanguage] = useState<string>("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("DISCOVERED");
   const [search, setSearch] = useState<string>("");
   const [searchInput, setSearchInput] = useState<string>("");
@@ -59,6 +72,9 @@ export default function NewsDiscoveryPage() {
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [previewArticle, setPreviewArticle] = useState<DiscoveredArticle | null>(null);
+  const [isEditingInModal, setIsEditingInModal] = useState<boolean>(false);
+  const [editTitle, setEditTitle] = useState<string>("");
+  const [editContentHtml, setEditContentHtml] = useState<string>("");
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -68,6 +84,8 @@ export default function NewsDiscoveryPage() {
     try {
       const params = new URLSearchParams();
       if (selectedCategory !== "ALL") params.append("categoryId", selectedCategory);
+      if (selectedPublisher !== "ALL") params.append("publisher", selectedPublisher);
+      if (selectedLanguage !== "ALL") params.append("language", selectedLanguage);
       if (statusFilter !== "ALL") params.append("status", statusFilter);
       if (search) params.append("search", search);
       params.append("page", page.toString());
@@ -85,7 +103,9 @@ export default function NewsDiscoveryPage() {
       setTotal(data.total || 0);
       if (data.categories) setCategories(data.categories);
       if (data.categoryCounts) setCategoryCounts(data.categoryCounts);
+      if (data.publisherCounts) setPublisherCounts(data.publisherCounts);
       if (data.statusCounts) setStatusCounts(data.statusCounts);
+      if (data.usage) setUsageInfo(data.usage);
     } catch (err: any) {
       setErrorMsg(err?.message || "Error loading discovery data");
     } finally {
@@ -95,12 +115,12 @@ export default function NewsDiscoveryPage() {
 
   useEffect(() => {
     loadData();
-  }, [page, selectedCategory, statusFilter, search]);
+  }, [page, selectedCategory, selectedPublisher, selectedLanguage, statusFilter, search]);
 
   // Auto-hide messages
   useEffect(() => {
     if (successMsg) {
-      const t = setTimeout(() => setSuccessMsg(null), 4000);
+      const t = setTimeout(() => setSuccessMsg(null), 4500);
       return () => clearTimeout(t);
     }
   }, [successMsg]);
@@ -141,6 +161,13 @@ export default function NewsDiscoveryPage() {
       }
 
       setSuccessMsg(data.message || "News discovery cycle completed successfully!");
+      if (data.callsToday !== undefined) {
+        setUsageInfo({
+          callsToday: data.callsToday,
+          maxDailyLimit: data.maxCalls || 4,
+          remainingCalls: data.remainingCalls || 0,
+        });
+      }
       setPage(1);
       await loadData();
     } catch (err: any) {
@@ -150,7 +177,7 @@ export default function NewsDiscoveryPage() {
     }
   }
 
-  // Dismiss article
+  // Dismiss article permanently
   async function handleDismiss(id: string) {
     setActionLoading((prev) => ({ ...prev, [id]: true }));
     try {
@@ -180,7 +207,7 @@ export default function NewsDiscoveryPage() {
   // Bulk dismiss selected
   async function handleBulkDismiss() {
     if (selectedIds.length === 0) return;
-    if (!confirm(`Are you sure you want to dismiss ${selectedIds.length} article(s)?`)) return;
+    if (!confirm(`Are you sure you want to dismiss ${selectedIds.length} article(s)? They will never reappear.`)) return;
 
     setLoading(true);
     try {
@@ -275,7 +302,8 @@ export default function NewsDiscoveryPage() {
         return;
       }
 
-      setSuccessMsg("Article published to live site! Visible to all users.");
+      setSuccessMsg("Article published to live website with full newspaper formatting!");
+      if (previewArticle?.id === id) setPreviewArticle(null);
       await loadData();
     } catch (err: any) {
       setErrorMsg(err?.message || "Error publishing article");
@@ -313,18 +341,17 @@ export default function NewsDiscoveryPage() {
 
   const totalPages = Math.ceil(total / limit) || 1;
 
-  function toggleSelectAll() {
-    if (selectedIds.length === articles.length) {
-      setSelectedIds([]);
-    } else {
-      setSelectedIds(articles.map((a) => a.id));
-    }
-  }
-
   function toggleSelectId(id: string) {
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]
     );
+  }
+
+  function openPreviewModal(art: DiscoveredArticle) {
+    setPreviewArticle(art);
+    setEditTitle(art.title);
+    setEditContentHtml(art.contentHtml || "");
+    setIsEditingInModal(false);
   }
 
   const activeCategoryObj = categories.find((c) => c.id === selectedCategory);
@@ -392,7 +419,7 @@ export default function NewsDiscoveryPage() {
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <h1 style={{ fontSize: 26, fontWeight: 800, margin: 0, color: "var(--brand)" }}>
-              News Discovery & Leads
+              News Discovery & Management
             </h1>
             <span
               style={{
@@ -404,15 +431,37 @@ export default function NewsDiscoveryPage() {
                 borderRadius: 20,
               }}
             >
-              SerpAPI Live
+              Newspaper Extraction Engine
             </span>
           </div>
           <p style={{ margin: "6px 0 0", color: "#6b7280", fontSize: 14 }}>
-            Automated intelligence discovering top verified news stories across all India Mornings desks.
+            Discovers real newspaper reporting from trusted publishers (Loksatta, Sakal, Lokmat, The Hindu, Indian Express, NDTV, Livemint), formats into 8-section newspaper articles, and publishes live.
           </p>
         </div>
 
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          {/* Daily SerpAPI Usage Tracker */}
+          {usageInfo && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: usageInfo.callsToday >= 4 ? "#fef2f2" : "#f0fdf4",
+                border: `1px solid ${usageInfo.callsToday >= 4 ? "#fca5a5" : "#86efac"}`,
+                borderRadius: 10,
+                padding: "8px 14px",
+                fontSize: 13,
+                fontWeight: 600,
+                color: usageInfo.callsToday >= 4 ? "#b91c1c" : "#15803d",
+              }}
+            >
+              <span>📊 SerpAPI Today:</span>
+              <span style={{ fontWeight: 800 }}>{usageInfo.callsToday} / {usageInfo.maxDailyLimit} calls</span>
+              <span style={{ fontSize: 11, opacity: 0.85 }}>({usageInfo.remainingCalls} remaining)</span>
+            </div>
+          )}
+
           {selectedCategory !== "ALL" && (
             <button
               onClick={() => triggerAutomatedFetch(selectedCategory)}
@@ -423,10 +472,10 @@ export default function NewsDiscoveryPage() {
                 color: "#374151",
                 border: "1px solid #d1d5db",
                 fontSize: 13,
-                padding: "10px 16px",
+                padding: "9px 15px",
               }}
             >
-              {fetchingNews ? "Fetching..." : `Fetch for ${activeCategoryObj?.name || "Category"}`}
+              {fetchingNews ? "Fetching..." : `Fetch ${activeCategoryObj?.name || "Category"}`}
             </button>
           )}
 
@@ -436,20 +485,20 @@ export default function NewsDiscoveryPage() {
             className="btn btnPrimary"
             style={{
               fontSize: 14,
-              padding: "10px 20px",
+              padding: "9px 18px",
               gap: 8,
               boxShadow: "0 4px 12px rgba(26, 3, 90, 0.2)",
             }}
           >
             {fetchingNews ? (
               <>
-                <span className="spinner" style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>⏳</span>
-                <span>Discovering Latest News...</span>
+                <span className="spinner" style={{ display: "inline-block" }}>⏳</span>
+                <span>Discovering Trusted News...</span>
               </>
             ) : (
               <>
                 <span>⚡</span>
-                <span>Discover All Desks Now</span>
+                <span>Run 4-Bucket Discovery</span>
               </>
             )}
           </button>
@@ -515,7 +564,7 @@ export default function NewsDiscoveryPage() {
           }}
         >
           <div style={{ fontSize: 12, fontWeight: 700, color: "#059669", textTransform: "uppercase" }}>
-            Converted to Drafts
+            Published / Converted
           </div>
           <div style={{ fontSize: 24, fontWeight: 800, color: "#065f46", marginTop: 4 }}>
             {statusCounts.converted}
@@ -534,7 +583,7 @@ export default function NewsDiscoveryPage() {
           }}
         >
           <div style={{ fontSize: 12, fontWeight: 700, color: "#6b7280", textTransform: "uppercase" }}>
-            Total Tracked
+            Total Monitored
           </div>
           <div style={{ fontSize: 24, fontWeight: 800, color: "#374151", marginTop: 4 }}>
             {statusCounts.total}
@@ -620,7 +669,7 @@ export default function NewsDiscoveryPage() {
         </div>
       </div>
 
-      {/* Search and Selection Action Bar */}
+      {/* Advanced Filters: Publisher, Language, Search */}
       <div
         style={{
           background: "white",
@@ -635,29 +684,91 @@ export default function NewsDiscoveryPage() {
           flexWrap: "wrap",
         }}
       >
-        <form onSubmit={handleSearchSubmit} style={{ display: "flex", gap: 8, flex: 1, maxWidth: 500 }}>
-          <input
-            className="input"
-            type="text"
-            placeholder="Search headlines, keywords, or sources..."
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            style={{ flex: 1, borderRadius: 8, padding: "8px 14px", fontSize: 13 }}
-          />
-          <button type="submit" className="btn btnPrimary" style={{ padding: "8px 16px", fontSize: 13 }}>
-            Search
-          </button>
-          {search && (
-            <button
-              type="button"
-              onClick={handleClearSearch}
-              className="btn"
-              style={{ background: "#f3f4f6", color: "#4b5563", padding: "8px 12px", fontSize: 13 }}
-            >
-              Clear
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flex: 1, minWidth: 320, flexWrap: "wrap" }}>
+          {/* Search Input */}
+          <form onSubmit={handleSearchSubmit} style={{ display: "flex", gap: 8, flex: 1, minWidth: 240 }}>
+            <input
+              className="input"
+              type="text"
+              placeholder="Search headlines, keywords, or sources..."
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ flex: 1, borderRadius: 8, padding: "8px 14px", fontSize: 13 }}
+            />
+            <button type="submit" className="btn btnPrimary" style={{ padding: "8px 16px", fontSize: 13 }}>
+              Search
             </button>
-          )}
-        </form>
+            {search && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="btn"
+                style={{ background: "#f3f4f6", color: "#4b5563", padding: "8px 12px", fontSize: 13 }}
+              >
+                Clear
+              </button>
+            )}
+          </form>
+
+          {/* Publisher Dropdown Filter */}
+          <select
+            value={selectedPublisher}
+            onChange={(e) => { setSelectedPublisher(e.target.value); setPage(1); }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #d1d5db",
+              fontSize: 13,
+              background: "white",
+              color: "#374151",
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            <option value="ALL">All Trusted Publishers</option>
+            <optgroup label="Marathi Publishers">
+              <option value="loksatta">Loksatta (लोकसत्ता)</option>
+              <option value="sakal">Sakal (सकाळ)</option>
+              <option value="lokmat">Lokmat (लोकमत)</option>
+              <option value="maharashtra times">Maharashtra Times (मटा)</option>
+              <option value="abp majha">ABP Majha (एबीपी माझा)</option>
+              <option value="tv9 marathi">TV9 Marathi</option>
+              <option value="news18 marathi">News18 Marathi</option>
+              <option value="pudhari">Pudhari (पुढारी)</option>
+              <option value="bbc marathi">BBC News Marathi</option>
+            </optgroup>
+            <optgroup label="National & Business">
+              <option value="the hindu">The Hindu</option>
+              <option value="indian express">The Indian Express</option>
+              <option value="ndtv">NDTV</option>
+              <option value="hindustan times">Hindustan Times</option>
+              <option value="economic times">The Economic Times</option>
+              <option value="livemint">Mint</option>
+              <option value="business-standard">Business Standard</option>
+              <option value="bbc news">BBC News</option>
+            </optgroup>
+          </select>
+
+          {/* Language Filter */}
+          <select
+            value={selectedLanguage}
+            onChange={(e) => { setSelectedLanguage(e.target.value); setPage(1); }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #d1d5db",
+              fontSize: 13,
+              background: "white",
+              color: "#374151",
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            <option value="ALL">All Languages</option>
+            <option value="MR">Marathi (मराठी)</option>
+            <option value="EN">English</option>
+          </select>
+        </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {selectedIds.length > 0 && (
@@ -693,7 +804,7 @@ export default function NewsDiscoveryPage() {
           )}
 
           <div style={{ fontSize: 13, color: "#6b7280" }}>
-            Showing <strong>{articles.length}</strong> of <strong>{total}</strong> articles
+            Showing <strong>{articles.length}</strong> of <strong>{total}</strong> leads
           </div>
         </div>
       </div>
@@ -702,7 +813,7 @@ export default function NewsDiscoveryPage() {
       {loading ? (
         <div style={{ textAlign: "center", padding: "60px 20px" }}>
           <div style={{ fontSize: 32, marginBottom: 12 }}>⏳</div>
-          <div style={{ fontSize: 16, fontWeight: 600, color: "#4b5563" }}>Loading discovered articles...</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: "#4b5563" }}>Extracting news and leads...</div>
         </div>
       ) : articles.length === 0 ? (
         <div
@@ -722,8 +833,8 @@ export default function NewsDiscoveryPage() {
             {search
               ? `No articles matching "${search}". Try adjusting your search query.`
               : selectedCategory !== "ALL"
-              ? `No active discovery leads for category "${activeCategoryObj?.name}". Click below to trigger automated discovery for this category!`
-              : "No active discovery leads currently in the queue. Click below to fetch the latest stories from SerpAPI!"}
+              ? `No active discovery leads for category "${activeCategoryObj?.name}". Click below to discover latest stories!`
+              : "No active discovery leads in the queue. Click below to run the 4-bucket discovery across trusted publishers!"}
           </p>
 
           <button
@@ -732,7 +843,7 @@ export default function NewsDiscoveryPage() {
             className="btn btnPrimary"
             style={{ padding: "10px 22px", fontSize: 14 }}
           >
-            {fetchingNews ? "Discovering..." : "⚡ Fetch Latest News Now"}
+            {fetchingNews ? "Discovering..." : "⚡ Run 4-Bucket Discovery"}
           </button>
         </div>
       ) : (
@@ -778,7 +889,6 @@ export default function NewsDiscoveryPage() {
                         alt={art.title}
                         style={{ width: "100%", height: "100%", objectFit: "cover" }}
                         onError={(e) => {
-                          // Hide broken image
                           (e.target as HTMLImageElement).style.display = "none";
                         }}
                       />
@@ -792,12 +902,12 @@ export default function NewsDiscoveryPage() {
                           justifyContent: "center",
                           background: "linear-gradient(135deg, #1A035A 0%, #3b0764 100%)",
                           color: "white",
-                          fontSize: 24,
+                          fontSize: 22,
                           fontWeight: 700,
                           opacity: 0.9,
                         }}
                       >
-                        India Mornings
+                        India Morning
                       </div>
                     )}
 
@@ -817,6 +927,23 @@ export default function NewsDiscoveryPage() {
                       }}
                     >
                       {art.categoryName || "News"}
+                    </span>
+
+                    {/* Language Badge */}
+                    <span
+                      style={{
+                        position: "absolute",
+                        top: 10,
+                        left: 95,
+                        background: art.language === "MR" ? "#b45309" : "#1e40af",
+                        color: "white",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: "4px 8px",
+                        borderRadius: 12,
+                      }}
+                    >
+                      {art.language === "MR" ? "मराठी" : "EN"}
                     </span>
 
                     {/* Selection Checkbox */}
@@ -841,7 +968,7 @@ export default function NewsDiscoveryPage() {
                       />
                     </div>
 
-                    {/* Status Badge if Dismissed or Draft Created */}
+                    {/* Status Badge */}
                     {art.status === "DISMISSED" && (
                       <span
                         style={{
@@ -893,6 +1020,25 @@ export default function NewsDiscoveryPage() {
                         Draft Created
                       </span>
                     ) : null}
+
+                    {/* Multi-Source Verified Badge */}
+                    {art.isMultiSourceVerified && (
+                      <span
+                        style={{
+                          position: "absolute",
+                          bottom: 10,
+                          right: 10,
+                          background: "rgba(22, 101, 52, 0.95)",
+                          color: "white",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          padding: "3px 8px",
+                          borderRadius: 8,
+                        }}
+                      >
+                        ✓ Multi-Source Verified
+                      </span>
+                    )}
                   </div>
 
                   {/* Body Content */}
@@ -915,14 +1061,20 @@ export default function NewsDiscoveryPage() {
                           style={{ width: 14, height: 14, borderRadius: 2 }}
                         />
                       )}
-                      <span style={{ fontWeight: 600, color: "#374151" }}>{art.source?.name || "News Source"}</span>
+                      <span style={{ fontWeight: 700, color: "#1e3a8a" }}>{art.source?.name || "Trusted Publisher"}</span>
                       <span>•</span>
                       <span>{art.publishedAt || "Recent"}</span>
+                      {art.wordCount && (
+                        <>
+                          <span>•</span>
+                          <span style={{ color: "#059669", fontWeight: 600 }}>{art.wordCount} words</span>
+                        </>
+                      )}
                     </div>
 
                     {/* Headline */}
                     <h3
-                      onClick={() => setPreviewArticle(art)}
+                      onClick={() => openPreviewModal(art)}
                       style={{
                         fontSize: 15,
                         fontWeight: 700,
@@ -954,7 +1106,7 @@ export default function NewsDiscoveryPage() {
                         overflow: "hidden",
                       }}
                     >
-                      {art.snippet || "Click details to read full story snippet."}
+                      {art.snippet || "Click details to review complete newspaper article."}
                     </p>
 
                     {/* Action Buttons */}
@@ -967,6 +1119,21 @@ export default function NewsDiscoveryPage() {
                         paddingTop: 12,
                       }}
                     >
+                      <button
+                        onClick={() => openPreviewModal(art)}
+                        className="btn"
+                        style={{
+                          background: "#f0fdf4",
+                          color: "#15803d",
+                          border: "1px solid #bbf7d0",
+                          fontSize: 12,
+                          padding: "7px 11px",
+                          fontWeight: 600,
+                        }}
+                      >
+                        📖 Review Full Story
+                      </button>
+
                       {art.status === "DISMISSED" ? (
                         <button
                           onClick={() => handleRestore(art.id)}
@@ -981,7 +1148,7 @@ export default function NewsDiscoveryPage() {
                             flex: 1,
                           }}
                         >
-                          {isActionRunning ? "Restoring..." : "↺ Restore Lead"}
+                          {isActionRunning ? "Restoring..." : "↺ Restore"}
                         </button>
                       ) : (
                         <>
@@ -1021,7 +1188,7 @@ export default function NewsDiscoveryPage() {
                             onClick={() => handleDismiss(art.id)}
                             disabled={isActionRunning}
                             className="btn"
-                            title="Dismiss lead (won't reappear)"
+                            title="Dismiss lead (will never reappear)"
                             style={{
                               background: "#fee2e2",
                               color: "#b91c1c",
@@ -1127,7 +1294,7 @@ export default function NewsDiscoveryPage() {
         </>
       )}
 
-      {/* Article Detail / Preview Modal */}
+      {/* Comprehensive Newspaper Article Review & Edit Modal */}
       {previewArticle && (
         <div
           style={{
@@ -1136,7 +1303,7 @@ export default function NewsDiscoveryPage() {
             left: 0,
             right: 0,
             bottom: 0,
-            background: "rgba(0, 0, 0, 0.5)",
+            background: "rgba(0, 0, 0, 0.6)",
             backdropFilter: "blur(4px)",
             zIndex: 1000,
             display: "flex",
@@ -1150,18 +1317,18 @@ export default function NewsDiscoveryPage() {
             style={{
               background: "white",
               borderRadius: 16,
-              maxWidth: 680,
+              maxWidth: 780,
               width: "100%",
-              maxHeight: "90vh",
+              maxHeight: "92vh",
               overflowY: "auto",
-              padding: 24,
-              boxShadow: "0 20px 40px rgba(0,0,0,0.25)",
+              padding: 26,
+              boxShadow: "0 20px 40px rgba(0,0,0,0.3)",
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Modal Header */}
+            {/* Modal Top Badges */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, marginBottom: 14 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <span
                   style={{
                     background: "var(--brand)",
@@ -1174,28 +1341,76 @@ export default function NewsDiscoveryPage() {
                 >
                   {previewArticle.categoryName || "News"}
                 </span>
-                <span style={{ fontSize: 12, color: "#6b7280" }}>
-                  Discovered {new Date(previewArticle.discoveredAt).toLocaleString()}
+
+                <span
+                  style={{
+                    background: previewArticle.language === "MR" ? "#b45309" : "#1e40af",
+                    color: "white",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: "3px 8px",
+                    borderRadius: 10,
+                  }}
+                >
+                  {previewArticle.language === "MR" ? "मराठी वृत्त" : "English News"}
                 </span>
+
+                {previewArticle.wordCount && (
+                  <span style={{ fontSize: 12, color: "#059669", fontWeight: 600 }}>
+                    {previewArticle.wordCount} words
+                  </span>
+                )}
+
+                {previewArticle.isMultiSourceVerified && (
+                  <span
+                    style={{
+                      background: "#dcfce7",
+                      color: "#166534",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      padding: "3px 8px",
+                      borderRadius: 10,
+                    }}
+                  >
+                    ✓ Multi-Source Verified
+                  </span>
+                )}
               </div>
-              <button
-                onClick={() => setPreviewArticle(null)}
-                style={{
-                  background: "none",
-                  border: "none",
-                  fontSize: 22,
-                  color: "#6b7280",
-                  cursor: "pointer",
-                  lineHeight: 1,
-                }}
-              >
-                ✕
-              </button>
+
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button
+                  onClick={() => setIsEditingInModal(!isEditingInModal)}
+                  className="btn"
+                  style={{
+                    background: isEditingInModal ? "#e0e7ff" : "#f3f4f6",
+                    color: isEditingInModal ? "#3730a3" : "#374151",
+                    fontSize: 12,
+                    padding: "6px 12px",
+                    fontWeight: 600,
+                  }}
+                >
+                  {isEditingInModal ? "👁 Preview" : "✏️ Edit Content"}
+                </button>
+
+                <button
+                  onClick={() => setPreviewArticle(null)}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    fontSize: 22,
+                    color: "#6b7280",
+                    cursor: "pointer",
+                    lineHeight: 1,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {/* Thumbnail Preview */}
             {previewArticle.thumbnailUrl && (
-              <div style={{ borderRadius: 12, overflow: "hidden", maxHeight: 260, marginBottom: 16 }}>
+              <div style={{ borderRadius: 12, overflow: "hidden", maxHeight: 280, marginBottom: 16 }}>
                 <img
                   src={previewArticle.thumbnailUrl}
                   alt={previewArticle.title}
@@ -1204,39 +1419,90 @@ export default function NewsDiscoveryPage() {
               </div>
             )}
 
-            {/* Title */}
-            <h2 style={{ fontSize: 20, fontWeight: 800, color: "var(--brand)", margin: "0 0 10px", lineHeight: 1.35 }}>
-              {previewArticle.title}
-            </h2>
+            {/* Title / Headline */}
+            {isEditingInModal ? (
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: "#374151", marginBottom: 6 }}>
+                  Headline:
+                </label>
+                <input
+                  type="text"
+                  className="input"
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  style={{ width: "100%", fontSize: 16, fontWeight: 700, padding: "10px 14px", borderRadius: 8 }}
+                />
+              </div>
+            ) : (
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: "var(--brand)", margin: "0 0 10px", lineHeight: 1.35 }}>
+                {previewArticle.title}
+              </h2>
+            )}
 
-            {/* Source info */}
+            {/* Source Info */}
             <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#4b5563", marginBottom: 16 }}>
               {previewArticle.source?.icon && (
                 <img src={previewArticle.source.icon} alt="" style={{ width: 16, height: 16 }} />
               )}
-              <span style={{ fontWeight: 600 }}>{previewArticle.source?.name}</span>
+              <span style={{ fontWeight: 700, color: "#1e3a8a" }}>{previewArticle.source?.name}</span>
               <span>•</span>
               <span>Published: {previewArticle.publishedAt || "Recently"}</span>
             </div>
 
-            {/* Full Story Content / Snippet */}
-            <div style={{ background: "#f9fafb", borderRadius: 10, padding: 18, marginBottom: 20, fontSize: 14, lineHeight: 1.7, color: "#374151", maxHeight: 350, overflowY: "auto" }}>
-              <div style={{ fontWeight: 700, fontSize: 12, color: "#4f46e5", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-                Full Article Content
+            {/* Key Facts Box if present */}
+            {previewArticle.keyFacts && previewArticle.keyFacts.length > 0 && (
+              <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: 14, marginBottom: 18 }}>
+                <div style={{ fontWeight: 700, fontSize: 12, color: "#b91c1c", marginBottom: 6, display: "flex", alignItems: "center", gap: 4 }}>
+                  <span>📌</span>
+                  <span>{previewArticle.language === "MR" ? "महत्त्वाचे मुद्दे व आकडेवारी" : "Key Facts & Data Points"}</span>
+                </div>
+                <ul style={{ margin: 0, paddingLeft: 18, color: "#334155", fontSize: 13, lineHeight: 1.6 }}>
+                  {previewArticle.keyFacts.map((fact, idx) => (
+                    <li key={idx} style={{ marginBottom: 4 }}>{fact}</li>
+                  ))}
+                </ul>
               </div>
-              {previewArticle.contentHtml ? (
+            )}
+
+            {/* Article Content / Editor */}
+            <div style={{ background: "#f9fafb", borderRadius: 10, padding: 20, marginBottom: 20, fontSize: 14, lineHeight: 1.8, color: "#374151" }}>
+              <div style={{ fontWeight: 700, fontSize: 12, color: "#4f46e5", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                {previewArticle.language === "MR" ? "वृत्तपत्रीय बातमी (सविस्तर मजकूर)" : "Newspaper-Quality Article Report"}
+              </div>
+
+              {isEditingInModal ? (
+                <textarea
+                  className="input"
+                  rows={14}
+                  value={editContentHtml}
+                  onChange={(e) => setEditContentHtml(e.target.value)}
+                  style={{ width: "100%", fontFamily: "monospace", fontSize: 13, lineHeight: 1.6, padding: 12, borderRadius: 8 }}
+                />
+              ) : previewArticle.contentHtml ? (
                 <div dangerouslySetInnerHTML={{ __html: previewArticle.contentHtml }} />
               ) : (
-                <p>{previewArticle.snippet || "No additional excerpt available."}</p>
+                <p>{previewArticle.snippet || "No detailed content extracted yet."}</p>
               )}
             </div>
 
-            {/* Original Link */}
-            <div style={{ marginBottom: 24, fontSize: 13, color: "#4b5563", wordBreak: "break-all" }}>
-              <strong>Original URL:</strong>{" "}
+            {/* Original Source URLs */}
+            <div style={{ marginBottom: 24, fontSize: 13, color: "#4b5563" }}>
+              <strong>Original Verified Source:</strong>{" "}
               <a href={previewArticle.link} target="_blank" rel="noopener noreferrer" style={{ color: "#4f46e5", textDecoration: "underline" }}>
                 {previewArticle.link}
               </a>
+              {previewArticle.sourceUrls && previewArticle.sourceUrls.length > 1 && (
+                <div style={{ marginTop: 6, fontSize: 12, color: "#6b7280" }}>
+                  <strong>Also reported by:</strong>{" "}
+                  {previewArticle.sourceUrls.slice(1).map((s, idx) => (
+                    <span key={idx} style={{ marginRight: 8 }}>
+                      <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color: "#2563eb", textDecoration: "underline" }}>
+                        {s.name}
+                      </a>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Actions inside modal */}
@@ -1289,4 +1555,3 @@ export default function NewsDiscoveryPage() {
     </div>
   );
 }
-

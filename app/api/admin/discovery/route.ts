@@ -1,6 +1,7 @@
 import { db } from "@/src/lib/firebase-admin";
 import { requireUser } from "@/src/auth/requireUser";
 import { requireRole } from "@/src/auth/rbac";
+import { getDailySerpApiUsage } from "@/src/lib/serpapi-tracker";
 import { jsonError, jsonOk } from "@/src/utils/http";
 
 export const runtime = "nodejs";
@@ -14,6 +15,8 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const categoryId = url.searchParams.get("categoryId") || undefined;
     const categorySlug = url.searchParams.get("categorySlug") || undefined;
+    const publisher = url.searchParams.get("publisher")?.toLowerCase().trim() || undefined;
+    const language = url.searchParams.get("language") || undefined; // "MR", "EN", or undefined
     const search = url.searchParams.get("search")?.toLowerCase().trim() || "";
     const status = url.searchParams.get("status") || "DISCOVERED"; // "DISCOVERED", "DISMISSED", "DRAFT_CREATED", or "ALL"
     const page = parseInt(url.searchParams.get("page") || "1");
@@ -38,25 +41,39 @@ export async function GET(req: Request) {
       query = query.where("categorySlug", "==", categorySlug);
     }
 
-    // Retrieve articles
     const snapshot = await query.get();
     let allArticles = snapshot.docs.map((d: any) => ({
       id: d.id,
       ...d.data(),
     }));
 
-    // Search filter in-memory (title, snippet, source)
+    // Publisher filter
+    if (publisher && publisher !== "all") {
+      allArticles = allArticles.filter((art: any) => {
+        const sourceName = (art.source?.name || "").toLowerCase();
+        const link = (art.link || "").toLowerCase();
+        return sourceName.includes(publisher) || link.includes(publisher);
+      });
+    }
+
+    // Language filter
+    if (language && language !== "ALL") {
+      allArticles = allArticles.filter((art: any) => art.language === language);
+    }
+
+    // Search filter (title, snippet, source, keyFacts)
     if (search) {
       allArticles = allArticles.filter((art: any) => {
         const titleMatch = art.title?.toLowerCase().includes(search);
         const snippetMatch = art.snippet?.toLowerCase().includes(search);
         const sourceMatch = art.source?.name?.toLowerCase().includes(search);
         const catMatch = art.categoryName?.toLowerCase().includes(search);
-        return titleMatch || snippetMatch || sourceMatch || catMatch;
+        const factMatch = Array.isArray(art.keyFacts) && art.keyFacts.some((f: string) => f.toLowerCase().includes(search));
+        return titleMatch || snippetMatch || sourceMatch || catMatch || factMatch;
       });
     }
 
-    // Sort in-memory by publishedAt or discoveredAt descending
+    // Sort descending by date
     allArticles.sort((a: any, b: any) => {
       const timeA = new Date(a.isoDate || a.publishedAt || a.discoveredAt || 0).getTime();
       const timeB = new Date(b.isoDate || b.publishedAt || b.discoveredAt || 0).getTime();
@@ -67,12 +84,12 @@ export async function GET(req: Request) {
     const skip = (page - 1) * limit;
     const paginatedArticles = allArticles.slice(skip, skip + limit);
 
-    // Compute category counts for active discovered leads
+    // Compute category counts, publisher list, and status counts
     const categoryCounts: Record<string, number> = {};
+    const publisherCounts: Record<string, number> = {};
     const statusCounts = { discovered: 0, dismissed: 0, converted: 0, total: 0 };
 
-    // Fetch all for counts
-    const fullSnap = await db.collection("discovered_articles").select("status", "categoryId").get();
+    const fullSnap = await db.collection("discovered_articles").select("status", "categoryId", "source", "link").get();
     fullSnap.docs.forEach((doc) => {
       const data = doc.data();
       statusCounts.total++;
@@ -81,12 +98,17 @@ export async function GET(req: Request) {
         if (data.categoryId) {
           categoryCounts[data.categoryId] = (categoryCounts[data.categoryId] || 0) + 1;
         }
+        const pubName = data.source?.name || "Other";
+        publisherCounts[pubName] = (publisherCounts[pubName] || 0) + 1;
       } else if (data.status === "DISMISSED") {
         statusCounts.dismissed++;
       } else if (data.status === "DRAFT_CREATED") {
         statusCounts.converted++;
       }
     });
+
+    // Today's SerpAPI usage
+    const usage = await getDailySerpApiUsage();
 
     return jsonOk({
       articles: paginatedArticles,
@@ -95,11 +117,16 @@ export async function GET(req: Request) {
       limit,
       categories,
       categoryCounts,
+      publisherCounts,
       statusCounts,
+      usage: {
+        callsToday: usage.callsCount,
+        maxDailyLimit: usage.maxLimit,
+        remainingCalls: Math.max(0, usage.maxLimit - usage.callsCount),
+      },
     });
   } catch (error: any) {
     console.error("Discovery API Error:", error);
-    return jsonError(error?.message || "Failed to load discovery leads", error?.status || 500);
+    return jsonError(error?.message || "Failed to load discovered news leads", error?.status || 500);
   }
 }
-

@@ -1,7 +1,19 @@
 import { db } from "@/src/lib/firebase-admin";
 import { slugify } from "@/src/utils/slug";
 import { generateSearchKeywords } from "@/src/utils/taxonomy";
-import { extractFullArticleContent } from "@/src/lib/article-extractor";
+import {
+  extractFullArticleContent,
+  cleanHeadline,
+  clusterAndDeduplicateArticles,
+  identifyPublisher,
+  TrustedPublisherInfo,
+} from "@/src/lib/article-extractor";
+import {
+  checkDailySerpApiQuota,
+  recordSerpApiCallUsage,
+  getDailySerpApiUsage,
+  MAX_DAILY_SERPAPI_CALLS,
+} from "@/src/lib/serpapi-tracker";
 
 export interface SerpApiSource {
   name: string;
@@ -35,17 +47,24 @@ export interface DiscoveredNewsArticle extends SerpApiNewsArticle {
   publishedArticleId?: string | null;
   isLivePublished?: boolean;
   contentHtml?: string;
+  language?: "MR" | "EN";
+  wordCount?: number;
+  isMultiSourceVerified?: boolean;
+  sourceUrls?: { name: string; url: string }[];
+  keyFacts?: string[];
 }
 
 export interface SerpApiNewsOptions {
   query?: string;
   engine?: "google_news" | "google";
-  gl?: string; // Geographic location, e.g. "in" for India
-  hl?: string; // Language, e.g. "en" for English, "mr" for Marathi, "hi" for Hindi
-  tbs?: string; // Time filter: "qdr:d" (past 24h), "qdr:w" (past week), "qdr:m" (past month)
+  gl?: string;
+  hl?: string;
+  tbs?: string;
   topicToken?: string;
   storyToken?: string;
   limit?: number;
+  skipQuotaCheck?: boolean;
+  bucketId?: string;
 }
 
 export interface SerpApiNewsResponse {
@@ -56,33 +75,25 @@ export interface SerpApiNewsResponse {
   query?: string;
   engine?: string;
   error?: string;
+  quotaRemaining?: number;
 }
 
 const DEFAULT_SERPAPI_KEY = "604b591d2d85c95b5b563c1eb585068558070ecedd3cf1520519622566d6192e";
 
-/**
- * Returns the configured SerpAPI key from environment or fallback
- */
 export function getSerpApiKey(): string {
   return process.env.SERPAPI_API_KEY || DEFAULT_SERPAPI_KEY;
 }
 
-/**
- * Generates a stable deterministic ID from a string (e.g. link or title)
- */
 function generateStableId(input: string): string {
   let hash = 0;
   for (let i = 0; i < input.length; i++) {
     const char = input.charCodeAt(i);
     hash = (hash << 5) - hash + char;
-    hash |= 0; // Convert to 32bit integer
+    hash |= 0;
   }
   return "serp_" + Math.abs(hash).toString(36);
 }
 
-/**
- * Sanitizes object data for Firestore by converting any undefined values to null or omitting them
- */
 function sanitizeForFirestore<T>(data: T): T {
   return JSON.parse(
     JSON.stringify(data, (_, value) => (value === undefined ? null : value))
@@ -90,11 +101,76 @@ function sanitizeForFirestore<T>(data: T): T {
 }
 
 /**
- * Fetches news results from SerpAPI Google News engine
+ * 4 Strategic Thematic Buckets strictly covering all news requirements
+ * within exactly 4 SerpAPI calls per daily cron execution.
+ */
+export const DAILY_FOUR_BUCKETS = [
+  {
+    id: "bucket_1_maharashtra_marathi",
+    name: "Maharashtra & Marathi News",
+    query: `(site:loksatta.com OR site:esakal.com OR site:lokmat.com OR site:maharashtratimes.com OR site:marathi.abplive.com OR site:tv9marathi.com OR site:news18marathi.com OR site:pudhari.news OR site:bbc.com/marathi) (Maharashtra OR Mumbai OR Pune OR Nagpur OR Vidarbha OR Mantralaya OR शासन)`,
+    hl: "mr",
+    gl: "in",
+    limit: 25,
+    defaultRegion: "MAHARASHTRA",
+    defaultLanguage: "MR" as const,
+  },
+  {
+    id: "bucket_2_national_politics",
+    name: "National & Indian Politics",
+    query: `(site:thehindu.com OR site:indianexpress.com OR site:ndtv.com OR site:indiatoday.in OR site:hindustantimes.com OR site:pib.gov.in) (India OR politics OR Parliament OR Cabinet OR "Supreme Court" OR election)`,
+    hl: "en",
+    gl: "in",
+    limit: 25,
+    defaultRegion: "INDIA",
+    defaultLanguage: "EN" as const,
+  },
+  {
+    id: "bucket_3_business_economy",
+    name: "Business, Economy & Finance",
+    query: `(site:economictimes.indiatimes.com OR site:business-standard.com OR site:livemint.com OR site:rbi.org.in) (economy OR markets OR Sensex OR Nifty OR RBI OR inflation OR rupee OR finance India)`,
+    hl: "en",
+    gl: "in",
+    limit: 25,
+    defaultRegion: "INDIA",
+    defaultLanguage: "EN" as const,
+  },
+  {
+    id: "bucket_4_world_sports_desks",
+    name: "International, Sports, Health, Education & Tech",
+    query: `(site:thehindu.com OR site:indianexpress.com OR site:hindustantimes.com OR site:ndtv.com OR site:bbc.com) (sports OR cricket OR world OR international OR technology OR health OR education OR crime) India`,
+    hl: "en",
+    gl: "in",
+    limit: 25,
+    defaultRegion: "GLOBAL",
+    defaultLanguage: "EN" as const,
+  },
+];
+
+/**
+ * Fetches news results from SerpAPI Google News engine with strict daily quota check
  */
 export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise<SerpApiNewsResponse> {
+  const fetchedAt = new Date().toISOString();
+
+  // 1. Quota Check (unless explicitly bypassed)
+  if (!options.skipQuotaCheck) {
+    const quota = await checkDailySerpApiQuota();
+    if (!quota.canProceed) {
+      console.warn(`[SerpAPI] Daily quota limit of ${MAX_DAILY_SERPAPI_CALLS} reached (${quota.callsMade} made today). Aborting request to conserve quota.`);
+      return {
+        success: false,
+        totalResults: 0,
+        articles: [],
+        fetchedAt,
+        error: `Daily SerpAPI quota limit reached (${quota.callsMade}/${MAX_DAILY_SERPAPI_CALLS} calls used today).`,
+        quotaRemaining: 0,
+      };
+    }
+  }
+
   const apiKey = getSerpApiKey();
-  const limit = options.limit || 20;
+  const limit = options.limit || 25;
   const gl = options.gl || "in";
   const hl = options.hl || "en";
 
@@ -114,19 +190,14 @@ export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise
     url.searchParams.set("story_token", options.storyToken);
   }
 
-  // Ensure fresh, recent news (default to past 24 hours: "qdr:d")
   const timeFilter = options.tbs !== undefined ? options.tbs : "qdr:d";
   if (timeFilter) {
     url.searchParams.set("tbs", timeFilter);
   }
 
-  const fetchedAt = new Date().toISOString();
-
   try {
     const res = await fetch(url.toString(), {
-      headers: {
-        Accept: "application/json",
-      },
+      headers: { Accept: "application/json" },
       next: { revalidate: 0 },
     });
 
@@ -154,20 +225,28 @@ export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise
       };
     }
 
+    // 2. Record API call usage immediately upon success
+    if (!options.skipQuotaCheck) {
+      await recordSerpApiCallUsage(
+        options.bucketId || "custom_query",
+        options.query || "news",
+        (data.news_results || []).length
+      );
+    }
+
     const rawNewsResults = data.news_results || [];
     const normalizedArticles: SerpApiNewsArticle[] = [];
 
     for (const item of rawNewsResults) {
       if (normalizedArticles.length >= limit) break;
 
-      // Handle direct article result
       if (item.title && item.link) {
         normalizedArticles.push({
           id: generateStableId(item.link || item.title),
-          title: item.title,
+          title: cleanHeadline(item.title),
           link: item.link,
           source: {
-            name: item.source?.name || item.source || "Unknown",
+            name: item.source?.name || item.source || "News Source",
             icon: item.source?.icon || undefined,
             authors: item.source?.authors || undefined,
           },
@@ -179,15 +258,14 @@ export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise
         });
       }
 
-      // Handle highlight item (Google News featured block)
       if (item.highlight && item.highlight.title && item.highlight.link) {
         const hlItem = item.highlight;
         normalizedArticles.push({
           id: generateStableId(hlItem.link || hlItem.title),
-          title: hlItem.title,
+          title: cleanHeadline(hlItem.title),
           link: hlItem.link,
           source: {
-            name: hlItem.source?.name || "Unknown",
+            name: hlItem.source?.name || "News Source",
             icon: hlItem.source?.icon || undefined,
             authors: hlItem.source?.authors || undefined,
           },
@@ -199,17 +277,16 @@ export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise
         });
       }
 
-      // Handle grouped sub-stories in Google News topics
       if (Array.isArray(item.stories)) {
         for (const story of item.stories) {
           if (normalizedArticles.length >= limit) break;
           if (story.title && story.link) {
             normalizedArticles.push({
               id: generateStableId(story.link || story.title),
-              title: story.title,
+              title: cleanHeadline(story.title),
               link: story.link,
               source: {
-                name: story.source?.name || "Unknown",
+                name: story.source?.name || "News Source",
                 icon: story.source?.icon || undefined,
                 authors: story.source?.authors || undefined,
               },
@@ -245,93 +322,26 @@ export async function fetchGoogleNews(options: SerpApiNewsOptions = {}): Promise
 }
 
 /**
- * Searches Google Search News tab (engine=google, tbm=nws) for deep keyword search
+ * Searches Google Search News tab (tbm=nws) for deep keyword search with quota check
  */
 export async function searchGoogleNews(query: string, options: SerpApiNewsOptions = {}): Promise<SerpApiNewsResponse> {
-  const apiKey = getSerpApiKey();
-  const limit = options.limit || 15;
-  const gl = options.gl || "in";
-  const hl = options.hl || "en";
-
-  const url = new URL("https://serpapi.com/search.json");
-  url.searchParams.set("engine", "google");
-  url.searchParams.set("tbm", "nws");
-  url.searchParams.set("q", query);
-  url.searchParams.set("gl", gl);
-  url.searchParams.set("hl", hl);
-  url.searchParams.set("api_key", apiKey);
-
-  const timeFilter = options.tbs !== undefined ? options.tbs : "qdr:d";
-  if (timeFilter) {
-    url.searchParams.set("tbs", timeFilter);
-  }
-
-  const fetchedAt = new Date().toISOString();
-
-  try {
-    const res = await fetch(url.toString(), {
-      headers: { Accept: "application/json" },
-      next: { revalidate: 0 },
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      return {
-        success: false,
-        totalResults: 0,
-        articles: [],
-        fetchedAt,
-        error: `SerpAPI Google News search returned status ${res.status}: ${errText.slice(0, 200)}`,
-      };
-    }
-
-    const data = await res.json();
-    const rawNewsResults = data.news_results || [];
-    const articles: SerpApiNewsArticle[] = rawNewsResults.slice(0, limit).map((item: any) => ({
-      id: generateStableId(item.link || item.title),
-      title: item.title,
-      link: item.link,
-      source: {
-        name: typeof item.source === "string" ? item.source : item.source?.name || "Unknown",
-        icon: item.source?.icon,
-      },
-      snippet: item.snippet || "",
-      thumbnailUrl: item.thumbnail || null,
-      publishedAt: item.date || item.published_at || fetchedAt,
-      isoDate: item.published_at || fetchedAt,
-      position: item.position,
-    }));
-
-    return {
-      success: true,
-      totalResults: articles.length,
-      articles,
-      fetchedAt,
-      query,
-      engine: "google_nws",
-    };
-  } catch (error: any) {
-    console.error("SerpAPI Google News search failed:", error);
-    return {
-      success: false,
-      totalResults: 0,
-      articles: [],
-      fetchedAt,
-      error: error?.message || "Unknown SerpAPI error",
-    };
-  }
+  return fetchGoogleNews({
+    ...options,
+    query,
+    engine: "google_news",
+  });
 }
 
 /**
  * Fetches the daily morning news digest for India
  */
 export async function fetchDailyMorningNews(options: { limit?: number; query?: string } = {}): Promise<SerpApiNewsResponse> {
-  // Query top stories for India
   return fetchGoogleNews({
-    query: options.query || "India top news",
+    query: options.query || "India Maharashtra top news",
     gl: "in",
     hl: "en",
     limit: options.limit || 25,
+    bucketId: "morning_digest",
   });
 }
 
@@ -343,7 +353,7 @@ export async function saveMorningNewsToFirestore(data: SerpApiNewsResponse): Pro
   savedCount: number;
   message: string;
 }> {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const today = new Date().toISOString().slice(0, 10);
   const timestamp = new Date().toISOString();
 
   try {
@@ -372,7 +382,7 @@ export async function saveMorningNewsToFirestore(data: SerpApiNewsResponse): Pro
       })
     );
 
-    // 3. Save individual articles into serpapi_articles collection (upsert to prevent duplicate IDs)
+    // 3. Save individual articles into serpapi_articles collection
     data.articles.forEach((art) => {
       const artRef = db.collection("serpapi_articles").doc(art.id);
       batch.set(
@@ -388,17 +398,6 @@ export async function saveMorningNewsToFirestore(data: SerpApiNewsResponse): Pro
 
     await batch.commit();
 
-    // 4. Record audit log
-    await db.collection("audit_logs").add({
-      actorId: "SYSTEM",
-      actorRole: "CRON",
-      action: "SERPAPI_DAILY_NEWS_SYNC",
-      entity: "SerpApiNews",
-      entityId: today,
-      count: data.articles.length,
-      createdAt: timestamp,
-    });
-
     return {
       snapshotId: today,
       savedCount: data.articles.length,
@@ -411,177 +410,7 @@ export async function saveMorningNewsToFirestore(data: SerpApiNewsResponse): Pro
 }
 
 /**
- * Executes the complete morning news cron job workflow:
- * 1. Fetches morning news via SerpAPI
- * 2. Persists to Firestore
- * 3. Returns execution summary
- */
-export async function executeDailyMorningNewsCron(): Promise<{
-  success: boolean;
-  count: number;
-  message: string;
-  timestamp: string;
-  articles?: SerpApiNewsArticle[];
-  error?: string;
-}> {
-  const timestamp = new Date().toISOString();
-
-  try {
-    console.log(`[SerpAPI Cron] Starting morning news fetch at ${timestamp}...`);
-
-    const newsResult = await fetchDailyMorningNews({ limit: 25 });
-
-    if (!newsResult.success) {
-      console.error("[SerpAPI Cron] Failed to fetch morning news:", newsResult.error);
-      return {
-        success: false,
-        count: 0,
-        message: newsResult.error || "Failed to fetch morning news",
-        timestamp,
-        error: newsResult.error,
-      };
-    }
-
-    console.log(`[SerpAPI Cron] Fetched ${newsResult.articles.length} news items. Saving to database...`);
-    const saveResult = await saveMorningNewsToFirestore(newsResult);
-
-    // Automatically publish the fresh morning news to live 'articles' so users immediately see today's news!
-    console.log("[SerpAPI Cron] Publishing fresh morning news to live articles...");
-    let publishedLiveCount = 0;
-    try {
-      const publishRes = await publishNewsToLiveArticles(newsResult.articles);
-      publishedLiveCount = publishRes.publishedCount;
-      console.log(`[SerpAPI Cron] Published ${publishedLiveCount} fresh news stories to live website.`);
-    } catch (pubErr) {
-      console.warn("[SerpAPI Cron] Live article publishing warning:", pubErr);
-    }
-
-    // Also run category news discovery for all existing categories and publish
-    console.log("[SerpAPI Cron] Running automated category discovery for desks...");
-    let categoryDiscoveryCount = 0;
-    try {
-      const discoveryResult = await discoverNewsForAllCategories({ limitPerCategory: 5, autoPublishToLive: true });
-      categoryDiscoveryCount = discoveryResult.totalAdded;
-      console.log(`[SerpAPI Cron] Discovered & published ${categoryDiscoveryCount} new categorized articles across ${discoveryResult.categoriesProcessed} categories.`);
-    } catch (discErr) {
-      console.warn("[SerpAPI Cron] Category discovery non-fatal warning:", discErr);
-    }
-
-    console.log(`[SerpAPI Cron] Successfully executed: ${saveResult.message}`);
-    return {
-      success: true,
-      count: saveResult.savedCount + categoryDiscoveryCount + publishedLiveCount,
-      message: `${saveResult.message}. Published ${publishedLiveCount} top stories and ${categoryDiscoveryCount} category leads to the live site.`,
-      timestamp,
-      articles: newsResult.articles,
-    };
-  } catch (error: any) {
-    console.error("[SerpAPI Cron] Error during execution:", error);
-    return {
-      success: false,
-      count: 0,
-      message: error?.message || "Execution failed",
-      timestamp,
-      error: error?.message,
-    };
-  }
-}
-
-/**
- * Query templates specifically tailored to existing categories
- */
-export const CATEGORY_QUERY_MAP: Record<string, string> = {
-  "astha": "spiritual news India",
-  "breaking": "Breaking news India",
-  "business": "Business news India",
-  "crime": "Crime news India",
-  "editorial": "opinion news India",
-  "education": "Education news India",
-  "entertainment": "Entertainment Bollywood news",
-  "health": "Health news India",
-  "national": "National news India",
-  "international": "World news",
-  "sports": "Sports news India",
-  "lifestyle": "Lifestyle news India",
-  "politices": "Politics news India",
-  "politics": "Politics news India",
-  "maharashtra": "Maharashtra news",
-  "mumbai": "Mumbai news",
-  "pune": "Pune news",
-  "nashik": "Nashik city news",
-  "vidharbha": "Vidarbha news",
-  "rashi-bhavishya": "horoscope today India",
-  "weather": "Weather forecast India",
-  "news": "Top news India",
-  "marathi": "Marathi news",
-  "hindi": "Hindi news",
-  "english": "India English news"
-};
-
-/**
- * Derives a targeted query for any existing category
- */
-export function getCategorySearchQuery(name: string, slug: string): string {
-  const normalizedSlug = (slug || "").toLowerCase().trim();
-  if (CATEGORY_QUERY_MAP[normalizedSlug]) {
-    return CATEGORY_QUERY_MAP[normalizedSlug];
-  }
-  const normalizedName = (name || "").toLowerCase().trim();
-  if (CATEGORY_QUERY_MAP[normalizedName]) {
-    return CATEGORY_QUERY_MAP[normalizedName];
-  }
-  return `${name} India news`;
-}
-
-/**
- * Automatically infers the most relevant category based on keywords in title & snippet
- */
-export async function inferCategory(
-  title: string,
-  snippet: string = ""
-): Promise<{ id: string; name: string; slug: string } | null> {
-  const text = `${title} ${snippet}`.toLowerCase();
-
-  const rules: { keywords: string[]; slug: string }[] = [
-    { keywords: ["cricket", "match", "wicket", "tournament", "ipl", "odi", "t20", "score", "batsman", "bowler", "athletics", "football", "hockey", "sports", "coach"], slug: "sports" },
-    { keywords: ["sensex", "nifty", "stock", "shares", "rbi", "inflation", "market", "gdp", "rupee", "bank", "investor", "revenue", "fiscal", "economy", "business"], slug: "business" },
-    { keywords: ["police", "arrest", "murder", "fir", "crime", "custody", "gangster", "cbi", "ed", "fraud", "scam", "smuggling", "encounter"], slug: "crime" },
-    { keywords: ["bollywood", "movie", "film", "actor", "actress", "box office", "trailer", "cinema", "ott", "entertainment"], slug: "entertainment" },
-    { keywords: ["hospital", "patient", "doctor", "health", "disease", "wellness", "medical", "surgery", "cancer", "vaccine", "dhanteras"], slug: "health" },
-    { keywords: ["rain", "monsoon", "cyclone", "temperature", "forecast", "weather", "imd", "heatwave", "delhi air", "pollution"], slug: "weather" },
-    { keywords: ["school", "college", "exam", "student", "cbse", "university", "neet", "jee", "education", "teacher", "academic"], slug: "education" },
-    { keywords: ["horoscope", "rashifal", "zodiac", "astrology", "astrological"], slug: "rashi-bhavishya" },
-    { keywords: ["temple", "puja", "dharma", "spiritual", "bhakti", "astha", "prasad", "deity"], slug: "astha" },
-    { keywords: ["election", "bjp", "congress", "vote", "poll", "minister", "parliament", "rahul gandhi", "modi", "politics", "cabinet", "mla", "mp"], slug: "politices" },
-    { keywords: ["mumbai", "bmc", "borivali", "dadar", "thane"], slug: "mumbai" },
-    { keywords: ["pune", "pmc"], slug: "pune" },
-    { keywords: ["nashik"], slug: "nashik" },
-    { keywords: ["vidarbha", "nagpur"], slug: "vidharbha" },
-    { keywords: ["maharashtra", "mantralaya", "fadnavis", "shinde", "thackeray"], slug: "maharashtra" },
-  ];
-
-  for (const rule of rules) {
-    if (rule.keywords.some((kw) => text.includes(kw))) {
-      const snap = await db.collection("categories").where("slug", "==", rule.slug).limit(1).get();
-      if (!snap.empty) {
-        const doc = snap.docs[0];
-        return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
-      }
-    }
-  }
-
-  // Fallback to "national" or "news"
-  const natSnap = await db.collection("categories").where("slug", "in", ["national", "news"]).limit(1).get();
-  if (!natSnap.empty) {
-    const doc = natSnap.docs[0];
-    return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
-  }
-
-  return null;
-}
-
-/**
- * Retrieves the set of all dismissed article IDs to guarantee they never reappear
+ * Retrieves the set of all dismissed article IDs to guarantee they NEVER reappear
  */
 export async function getDismissedIdsSet(): Promise<Set<string>> {
   const set = new Set<string>();
@@ -595,20 +424,303 @@ export async function getDismissedIdsSet(): Promise<Set<string>> {
 }
 
 /**
- * Discovers and saves latest relevant news for a single category
+ * Maps discovered news directly to existing categories
+ */
+export async function inferCategory(
+  title: string,
+  snippet: string = ""
+): Promise<{ id: string; name: string; slug: string } | null> {
+  const text = `${title} ${snippet}`.toLowerCase();
+
+  const rules: { keywords: string[]; slug: string }[] = [
+    { keywords: ["cricket", "match", "wicket", "tournament", "ipl", "odi", "t20", "score", "batsman", "bowler", "athletics", "football", "hockey", "sports", "coach", "खेळ", "क्रिकेट"], slug: "sports" },
+    { keywords: ["sensex", "nifty", "stock", "shares", "rbi", "inflation", "market", "gdp", "rupee", "bank", "investor", "revenue", "fiscal", "economy", "business", "व्यापार", "अर्थव्यवस्था", "शेअर बाजार"], slug: "business" },
+    { keywords: ["police", "arrest", "murder", "fir", "crime", "custody", "gangster", "cbi", "ed", "fraud", "scam", "smuggling", "encounter", "गुन्हे", "हत्या", "अटक", "पोलीस"], slug: "crime" },
+    { keywords: ["bollywood", "movie", "film", "actor", "actress", "box office", "trailer", "cinema", "ott", "entertainment", "मनोरंजन", "चित्रपट", "अभिनेता"], slug: "entertainment" },
+    { keywords: ["hospital", "patient", "doctor", "health", "disease", "wellness", "medical", "surgery", "cancer", "vaccine", "आरोग्य", "रुग्णालय", "डॉक्टर"], slug: "health" },
+    { keywords: ["rain", "monsoon", "cyclone", "temperature", "forecast", "weather", "imd", "heatwave", "delhi air", "pollution", "हवामान", "पाऊस"], slug: "weather" },
+    { keywords: ["school", "college", "exam", "student", "cbse", "university", "neet", "jee", "education", "teacher", "academic", "शिक्षण", "विद्यापीठ", "परीक्षा"], slug: "education" },
+    { keywords: ["horoscope", "rashifal", "zodiac", "astrology", "astrological", "राशी", "भविष्य", "कुंडली"], slug: "rashi-bhavishya" },
+    { keywords: ["temple", "puja", "dharma", "spiritual", "bhakti", "astha", "prasad", "deity", "मंदिर", "पूजा", "आस्था", "अध्यात्मिक"], slug: "astha" },
+    { keywords: ["election", "bjp", "congress", "vote", "poll", "minister", "parliament", "rahul gandhi", "modi", "politics", "cabinet", "mla", "mp", "निवडणूक", "राजकारण", "मंत्रिमंडळ"], slug: "politices" },
+    { keywords: ["mumbai", "bmc", "borivali", "dadar", "thane", "मुंबई", "ठाणे"], slug: "mumbai" },
+    { keywords: ["pune", "pmc", "पुणे"], slug: "pune" },
+    { keywords: ["nashik", "नाशिक"], slug: "nashik" },
+    { keywords: ["vidarbha", "nagpur", "विदर्भ", "नागपूर"], slug: "vidharbha" },
+    { keywords: ["maharashtra", "mantralaya", "fadnavis", "shinde", "thackeray", "महाराष्ट्र", "मंत्रालय"], slug: "maharashtra" },
+    { keywords: ["editorial", "opinion", "analysis", "संपादकीय", "अग्रलेख"], slug: "editorial" },
+    { keywords: ["world", "global", "us", "russia", "china", "uk", "israel", "iran", "international", "आंतरराष्ट्रीय", "परदेश"], slug: "international" },
+    { keywords: ["breaking", "urgent", "flash", "ताजी बातमी", "महत्त्वाचे वृत्त"], slug: "breaking" },
+  ];
+
+  for (const rule of rules) {
+    if (rule.keywords.some((kw) => text.includes(kw))) {
+      const snap = await db.collection("categories").where("slug", "==", rule.slug).limit(1).get();
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
+      }
+    }
+  }
+
+  // Fallback to "maharashtra" or "national"
+  const natSnap = await db.collection("categories").where("slug", "in", ["maharashtra", "national", "news"]).limit(1).get();
+  if (!natSnap.empty) {
+    const doc = natSnap.docs[0];
+    return { id: doc.id, name: doc.data().name, slug: doc.data().slug };
+  }
+
+  return null;
+}
+
+/**
+ * Core 4-Bucket News Discovery Engine:
+ * Strictly executes MAXIMUM 4 SerpAPI calls, discovering 80-100 high-quality stories,
+ * extracts full newspaper-grade articles, and synchronizes to Discovery & Live site.
+ */
+export async function executeFourBucketMorningNewsCron(options?: {
+  autoPublishToLive?: boolean;
+}): Promise<{
+  success: boolean;
+  count: number;
+  message: string;
+  timestamp: string;
+  callsMade: number;
+  publishedLiveCount: number;
+  articles?: DiscoveredNewsArticle[];
+  error?: string;
+}> {
+  const timestamp = new Date().toISOString();
+  console.log(`[SerpAPI 4-Bucket Engine] Starting morning execution at ${timestamp}...`);
+
+  // Verify daily quota
+  const quota = await checkDailySerpApiQuota();
+  if (!quota.canProceed) {
+    return {
+      success: false,
+      count: 0,
+      message: `Daily SerpAPI call quota exhausted (${quota.callsMade}/${MAX_DAILY_SERPAPI_CALLS} calls used today).`,
+      timestamp,
+      callsMade: quota.callsMade,
+      publishedLiveCount: 0,
+      error: "Daily quota exhausted",
+    };
+  }
+
+  const dismissedSet = await getDismissedIdsSet();
+  const rawArticles: SerpApiNewsArticle[] = [];
+  let callsMadeThisRun = 0;
+
+  // Execute up to the remaining quota (at most 4 calls)
+  for (const bucket of DAILY_FOUR_BUCKETS) {
+    if (callsMadeThisRun >= quota.remaining) {
+      console.log(`[SerpAPI 4-Bucket Engine] Reached remaining daily quota limit (${callsMadeThisRun} calls made).`);
+      break;
+    }
+
+    console.log(`[SerpAPI 4-Bucket Engine] Executing Call #${callsMadeThisRun + 1}: ${bucket.name}...`);
+    try {
+      const res = await fetchGoogleNews({
+        query: bucket.query,
+        gl: bucket.gl,
+        hl: bucket.hl,
+        limit: bucket.limit,
+        bucketId: bucket.id,
+      });
+
+      callsMadeThisRun++;
+
+      if (res.success && res.articles && res.articles.length > 0) {
+        // Tag with bucket defaults
+        for (const art of res.articles) {
+          art.region = bucket.defaultRegion;
+          rawArticles.push(art);
+        }
+        console.log(`[SerpAPI 4-Bucket Engine] Bucket "${bucket.name}" fetched ${res.articles.length} stories.`);
+      } else {
+        console.warn(`[SerpAPI 4-Bucket Engine] Bucket "${bucket.name}" returned 0 articles or error:`, res.error);
+      }
+    } catch (bucketErr) {
+      console.error(`[SerpAPI 4-Bucket Engine] Bucket "${bucket.name}" failed:`, bucketErr);
+    }
+  }
+
+  console.log(`[SerpAPI 4-Bucket Engine] Completed ${callsMadeThisRun} API calls. Total raw articles gathered: ${rawArticles.length}`);
+
+  // Deduplicate and cluster across the 4 buckets
+  const clustered = clusterAndDeduplicateArticles(rawArticles);
+  console.log(`[SerpAPI 4-Bucket Engine] Clustered into ${clustered.length} unique news stories.`);
+
+  const discoveredArticles: DiscoveredNewsArticle[] = [];
+  let publishedLiveCount = 0;
+  const shouldAutoPublish = options?.autoPublishToLive !== false; // Default true for morning cron
+
+  // Process and extract rich newspaper articles
+  for (const item of clustered) {
+    // 1. Skip if dismissed
+    if (dismissedSet.has(item.id)) {
+      continue;
+    }
+
+    const docRef = db.collection("discovered_articles").doc(item.id);
+    const existing = await docRef.get();
+
+    // 2. Infer existing category
+    const cat = await inferCategory(item.title, item.snippet || "");
+    const categoryId = cat?.id || "news";
+    const categoryName = cat?.name || "News";
+    const categorySlug = cat?.slug || "news";
+
+    // 3. Extract real newspaper article content
+    let extractedResult;
+    try {
+      extractedResult = await extractFullArticleContent(item.link, {
+        fallbackTitle: item.title,
+        fallbackSnippet: item.snippet,
+        sourceName: item.source?.name,
+        timeoutMs: 5000,
+      });
+    } catch (extErr) {
+      console.warn(`[SerpAPI Extraction] Warning for ${item.link}:`, extErr);
+    }
+
+    const discoveredArt: DiscoveredNewsArticle = {
+      id: item.id,
+      title: extractedResult?.cleanTitle || cleanHeadline(item.title),
+      link: item.link,
+      source: item.source,
+      snippet: extractedResult?.excerpt || item.snippet,
+      thumbnailUrl: extractedResult?.leadImage || item.thumbnailUrl || null,
+      publishedAt: extractedResult?.publishedTime || item.publishedAt || timestamp,
+      isoDate: extractedResult?.publishedTime || item.isoDate || timestamp,
+      categoryId,
+      categoryName,
+      categorySlug,
+      status: existing.exists ? (existing.data()?.status || "DISCOVERED") : "DISCOVERED",
+      discoveredAt: existing.exists ? (existing.data()?.discoveredAt || timestamp) : timestamp,
+      dismissedAt: null,
+      dismissedBy: null,
+      draftArticleId: existing.exists ? (existing.data()?.draftArticleId || null) : null,
+      contentHtml: extractedResult?.contentHtml,
+      language: extractedResult?.language || (item.region === "MAHARASHTRA" ? "MR" : "EN"),
+      wordCount: extractedResult?.wordCount,
+      isMultiSourceVerified: item.duplicateCount > 1,
+      sourceUrls: item.combinedSources,
+      keyFacts: extractedResult?.keyFacts || [],
+    };
+
+    // Upsert into discovered_articles
+    await docRef.set(sanitizeForFirestore(discoveredArt), { merge: true });
+    discoveredArticles.push(discoveredArt);
+
+    // 4. If autoPublish is enabled and not already published, publish to live articles!
+    if (shouldAutoPublish && !discoveredArt.draftArticleId && discoveredArt.status === "DISCOVERED") {
+      try {
+        const pubRes = await publishArticleToLive(discoveredArt, {
+          categoryId,
+          categoryName,
+          categorySlug,
+        });
+        if (pubRes.success) {
+          publishedLiveCount++;
+        }
+      } catch (pubErr) {
+        console.warn(`Could not auto-publish article "${discoveredArt.title}" to live:`, pubErr);
+      }
+    }
+  }
+
+  // Save morning snapshot
+  await saveMorningNewsToFirestore({
+    success: true,
+    totalResults: rawArticles.length,
+    articles: rawArticles,
+    fetchedAt: timestamp,
+    query: "4-Bucket India & Maharashtra Strategic Digest",
+  });
+
+  return {
+    success: true,
+    count: discoveredArticles.length,
+    callsMade: callsMadeThisRun,
+    publishedLiveCount,
+    message: `Completed 4-bucket morning run with ${callsMadeThisRun} SerpAPI calls. Discovered ${discoveredArticles.length} unique stories, published ${publishedLiveCount} to live site.`,
+    timestamp,
+    articles: discoveredArticles,
+  };
+}
+
+/**
+ * Standard Daily Morning News Cron Job Handler (called at 8:00 AM IST)
+ */
+export async function executeDailyMorningNewsCron(): Promise<{
+  success: boolean;
+  count: number;
+  message: string;
+  timestamp: string;
+  articles?: SerpApiNewsArticle[];
+  error?: string;
+}> {
+  const result = await executeFourBucketMorningNewsCron({ autoPublishToLive: true });
+  return {
+    success: result.success,
+    count: result.count,
+    message: result.message,
+    timestamp: result.timestamp,
+    articles: result.articles,
+    error: result.error,
+  };
+}
+
+/**
+ * Alias for discoverNewsForAllCategories to guarantee it NEVER makes 24 calls!
+ * It routes directly to the strict 4-bucket engine.
+ */
+export async function discoverNewsForAllCategories(options?: {
+  limitPerCategory?: number;
+  categoryIds?: string[];
+  autoPublishToLive?: boolean;
+}): Promise<{ totalAdded: number; categoriesProcessed: number; publishedLiveTotal: number; details: Record<string, number> }> {
+  console.log("[SerpAPI Discovery] Running 4-bucket discovery engine (max 4 calls enforced)...");
+  const res = await executeFourBucketMorningNewsCron({
+    autoPublishToLive: options?.autoPublishToLive,
+  });
+
+  const details: Record<string, number> = {};
+  if (res.articles) {
+    for (const art of res.articles) {
+      details[art.categoryName] = (details[art.categoryName] || 0) + 1;
+    }
+  }
+
+  return {
+    totalAdded: res.count,
+    categoriesProcessed: Object.keys(details).length,
+    publishedLiveTotal: res.publishedLiveCount,
+    details,
+  };
+}
+
+/**
+ * Single-category discovery with daily quota check
  */
 export async function discoverNewsForCategory(
   category: { id: string; name: string; slug: string },
   limit = 8,
   options?: { autoPublishToLive?: boolean }
 ): Promise<{ added: number; totalFetched: number; publishedLive: number }> {
-  const query = getCategorySearchQuery(category.name, category.slug);
+  const quota = await checkDailySerpApiQuota();
+  if (!quota.canProceed) {
+    console.warn(`[SerpAPI] Daily quota exhausted (${quota.callsMade}/${MAX_DAILY_SERPAPI_CALLS}). Skipping single-category API call.`);
+    return { added: 0, totalFetched: 0, publishedLive: 0 };
+  }
+
   const serpRes = await fetchGoogleNews({
-    query,
+    query: `${category.name} news India`,
     gl: "in",
-    hl: "en",
-    tbs: "qdr:d",
+    hl: category.slug === "marathi" || category.slug === "maharashtra" ? "mr" : "en",
     limit,
+    bucketId: `category_${category.slug}`,
   });
 
   if (!serpRes.success || !serpRes.articles || serpRes.articles.length === 0) {
@@ -621,66 +733,24 @@ export async function discoverNewsForCategory(
   let publishedLive = 0;
 
   for (const art of serpRes.articles) {
-    // Crucial requirement: Ensure dismissed news NEVER reappears!
-    if (dismissedSet.has(art.id)) {
-      continue;
-    }
+    if (dismissedSet.has(art.id)) continue;
 
     const docRef = db.collection("discovered_articles").doc(art.id);
     const existing = await docRef.get();
+    if (existing.exists && existing.data()?.status === "DISMISSED") continue;
 
-    if (existing.exists) {
-      const data = existing.data();
-      // If previously dismissed, preserve dismissed state and skip
-      if (data?.status === "DISMISSED") {
-        continue;
-      }
-      // If autoPublishToLive is enabled and this article hasn't been published yet, publish it to live
-      if (options?.autoPublishToLive && !data?.draftArticleId) {
-        try {
-          const leadArt: DiscoveredNewsArticle = {
-            id: art.id,
-            ...(data as any),
-            categoryId: category.id,
-            categoryName: category.name,
-            categorySlug: category.slug,
-          };
-          const pubRes = await publishArticleToLive(leadArt, {
-            categoryId: category.id,
-            categoryName: category.name,
-            categorySlug: category.slug,
-          });
-          if (pubRes.success) {
-            publishedLive++;
-          }
-        } catch (pubErr) {
-          console.warn(`Could not auto-publish existing article "${art.title}" to live:`, pubErr);
-        }
-      }
-      continue;
-    }
-
-    let leadImage: string | null = null;
-    let fullExcerpt: string | undefined = undefined;
-    let fullContentHtml: string | undefined = undefined;
-
-    try {
-      const extracted = await extractFullArticleContent(art.link, {
-        fallbackTitle: art.title,
-        fallbackSnippet: art.snippet,
-        sourceName: art.source?.name,
-        timeoutMs: 4000,
-      });
-      leadImage = extracted.leadImage || null;
-      fullExcerpt = extracted.excerpt;
-      fullContentHtml = extracted.contentHtml;
-    } catch (e) {}
+    const extracted = await extractFullArticleContent(art.link, {
+      fallbackTitle: art.title,
+      fallbackSnippet: art.snippet,
+      sourceName: art.source?.name,
+    });
 
     const discoveredArt: DiscoveredNewsArticle = {
       ...art,
-      snippet: fullExcerpt || art.snippet,
-      thumbnailUrl: art.thumbnailUrl || leadImage || null,
-      contentHtml: fullContentHtml,
+      title: extracted.cleanTitle || art.title,
+      snippet: extracted.excerpt || art.snippet,
+      thumbnailUrl: extracted.leadImage || art.thumbnailUrl || null,
+      contentHtml: extracted.contentHtml,
       categoryId: category.id,
       categoryName: category.name,
       categorySlug: category.slug,
@@ -689,12 +759,14 @@ export async function discoverNewsForCategory(
       dismissedAt: null,
       dismissedBy: null,
       draftArticleId: null,
+      language: extracted.language,
+      wordCount: extracted.wordCount,
+      keyFacts: extracted.keyFacts,
     };
 
-    await docRef.set(sanitizeForFirestore(discoveredArt));
+    await docRef.set(sanitizeForFirestore(discoveredArt), { merge: true });
     added++;
 
-    // If autoPublishToLive is enabled, immediately publish to the live site
     if (options?.autoPublishToLive) {
       try {
         const pubRes = await publishArticleToLive(discoveredArt, {
@@ -702,60 +774,12 @@ export async function discoverNewsForCategory(
           categoryName: category.name,
           categorySlug: category.slug,
         });
-        if (pubRes.success) {
-          publishedLive++;
-        }
-      } catch (pubErr) {
-        console.warn(`Could not auto-publish article "${art.title}" to live:`, pubErr);
-      }
+        if (pubRes.success) publishedLive++;
+      } catch (e) {}
     }
   }
 
   return { added, totalFetched: serpRes.articles.length, publishedLive };
-}
-
-/**
- * Discovers news for all existing categories in the database
- */
-export async function discoverNewsForAllCategories(options?: {
-  limitPerCategory?: number;
-  categoryIds?: string[];
-  autoPublishToLive?: boolean;
-}): Promise<{ totalAdded: number; categoriesProcessed: number; publishedLiveTotal: number; details: Record<string, number> }> {
-  const limitPerCat = options?.limitPerCategory || 5;
-  const categoriesSnap = await db.collection("categories").get();
-  const categories = categoriesSnap.docs.map((doc) => ({
-    id: doc.id,
-    name: doc.data().name,
-    slug: doc.data().slug,
-  }));
-
-  const filteredCategories = options?.categoryIds && options.categoryIds.length > 0
-    ? categories.filter((c) => options.categoryIds!.includes(c.id))
-    : categories;
-
-  let totalAdded = 0;
-  let publishedLiveTotal = 0;
-  const details: Record<string, number> = {};
-
-  for (const cat of filteredCategories) {
-    try {
-      const res = await discoverNewsForCategory(cat, limitPerCat, { autoPublishToLive: options?.autoPublishToLive });
-      details[cat.name] = res.added;
-      totalAdded += res.added;
-      publishedLiveTotal += res.publishedLive;
-    } catch (err) {
-      console.error(`Error discovering news for category ${cat.name}:`, err);
-      details[cat.name] = 0;
-    }
-  }
-
-  return {
-    totalAdded,
-    categoriesProcessed: filteredCategories.length,
-    publishedLiveTotal,
-    details,
-  };
 }
 
 /**
@@ -773,7 +797,7 @@ export async function dismissDiscoveredArticle(
     id,
     dismissedAt: timestamp,
     dismissedBy: actorId,
-    reason: reason || "Irrelevant or not required",
+    reason: reason || "Irrelevant or dismissed by editor",
   });
 
   // 2. Update status in discovered_articles collection, and archive from live site if published
@@ -820,10 +844,8 @@ export async function restoreDiscoveredArticle(
 ): Promise<{ success: boolean; message: string }> {
   const timestamp = new Date().toISOString();
 
-  // 1. Remove from dismissed_news collection
   await db.collection("dismissed_news").doc(id).delete();
 
-  // 2. Update status in discovered_articles collection and unarchive live article if exists
   const artRef = db.collection("discovered_articles").doc(id);
   const existing = await artRef.get();
   if (existing.exists) {
@@ -845,7 +867,6 @@ export async function restoreDiscoveredArticle(
     });
   }
 
-  // 3. Audit log
   await db.collection("audit_logs").add({
     actorId,
     actorRole: "ADMIN",
@@ -883,26 +904,33 @@ export async function convertDiscoveredToDraft(
 
   const searchKeywords = generateSearchKeywords([data.title, data.snippet || ""]);
 
-  // Extract full rich article content from the original publisher URL
-  const extracted = await extractFullArticleContent(data.link, {
-    fallbackTitle: data.title,
-    fallbackSnippet: data.snippet,
-    sourceName: data.source?.name,
-  });
+  // Extract full rich newspaper content
+  let contentHtml = data.contentHtml;
+  let excerpt = data.snippet;
+  let coverImageUrl = data.thumbnailUrl;
+  let lang = data.language || "EN";
 
-  const contentHtml = extracted.contentHtml;
-  const excerpt = extracted.excerpt || data.snippet || null;
-  const coverImageUrl = data.thumbnailUrl || extracted.leadImage || null;
+  if (!contentHtml) {
+    const extracted = await extractFullArticleContent(data.link, {
+      fallbackTitle: data.title,
+      fallbackSnippet: data.snippet,
+      sourceName: data.source?.name,
+    });
+    contentHtml = extracted.contentHtml;
+    excerpt = extracted.excerpt || data.snippet;
+    coverImageUrl = coverImageUrl || extracted.leadImage || null;
+    lang = extracted.language;
+  }
 
   const newArticle = {
     title: data.title,
     slug,
     searchKeywords,
-    excerpt,
+    excerpt: excerpt || null,
     contentHtml,
-    coverImageUrl,
-    language: "EN",
-    region: "MAHARASHTRA",
+    coverImageUrl: coverImageUrl || null,
+    language: lang,
+    region: lang === "MR" ? "MAHARASHTRA" : "INDIA",
     categoryIds: data.categoryId ? [data.categoryId] : [],
     categoryId: data.categoryId || null,
     authorId: actor.id,
@@ -917,7 +945,7 @@ export async function convertDiscoveredToDraft(
     updatedAt: timestamp,
   };
 
-  const articleRef = await db.collection("articles").add(newArticle);
+  const articleRef = await db.collection("articles").add(sanitizeForFirestore(newArticle));
 
   await artRef.update({
     status: "DRAFT_CREATED",
@@ -1024,16 +1052,27 @@ export async function publishArticleToLive(
   const publishedAt = art.isoDate || now;
   const sourceName = art.source?.name || "India Morning News Desk";
 
-  // Extract full rich article content from the original publisher URL
-  const extracted = await extractFullArticleContent(art.link, {
-    fallbackTitle: art.title,
-    fallbackSnippet: art.snippet,
-    sourceName,
-  });
+  // Use pre-extracted content or extract full newspaper content
+  let contentHtml = (art as DiscoveredNewsArticle).contentHtml;
+  let excerpt = art.snippet || art.title;
+  let coverImageUrl = art.thumbnailUrl || null;
+  let lang = (art as DiscoveredNewsArticle).language;
 
-  const contentHtml = extracted.contentHtml;
-  const excerpt = extracted.excerpt || art.snippet || art.title;
-  const coverImageUrl = art.thumbnailUrl || extracted.leadImage || null;
+  if (!contentHtml) {
+    const extracted = await extractFullArticleContent(art.link, {
+      fallbackTitle: art.title,
+      fallbackSnippet: art.snippet,
+      sourceName,
+    });
+    contentHtml = extracted.contentHtml;
+    excerpt = extracted.excerpt || art.snippet || art.title;
+    coverImageUrl = coverImageUrl || extracted.leadImage || null;
+    lang = extracted.language;
+  }
+
+  if (!lang) {
+    lang = /[\u0900-\u097F]/.test(art.title) ? "MR" : "EN";
+  }
 
   const newArticle = {
     title: art.title,
@@ -1042,8 +1081,8 @@ export async function publishArticleToLive(
     excerpt,
     contentHtml,
     coverImageUrl,
-    language: "EN",
-    region: "MAHARASHTRA",
+    language: lang,
+    region: lang === "MR" ? "MAHARASHTRA" : "INDIA",
     categoryIds: categoryId ? [categoryId] : [],
     categoryId: categoryId || null,
     authorId,
@@ -1068,6 +1107,8 @@ export async function publishArticleToLive(
       await discRef.update({
         status: "DRAFT_CREATED",
         draftArticleId: articleRef.id,
+        isLivePublished: true,
+        publishedArticleId: articleRef.id,
         updatedAt: now,
       });
     }
