@@ -95,7 +95,17 @@ export default function ArticleClientPage({
       }
     };
 
-    loadSocialScripts();
+    // Only load heavy social scripts if the article actually contains embeds
+    const hasSocialEmbeds = initialArticle?.contentHtml && (
+      initialArticle.contentHtml.includes('twitter.com') ||
+      initialArticle.contentHtml.includes('x.com') ||
+      initialArticle.contentHtml.includes('instagram.com') ||
+      initialArticle.contentHtml.includes('facebook.com')
+    );
+
+    if (hasSocialEmbeds) {
+      loadSocialScripts();
+    }
 
     if (article) return;
 
@@ -124,9 +134,17 @@ export default function ArticleClientPage({
     fetchData();
   }, [article?.slug, base, initialArticle?.slug]);
 
-  // Re-process social embeds whenever content changes or loads
+  // Re-process social embeds only if content contains social embeds
   useEffect(() => {
     if (!article?.contentHtml) return;
+
+    const hasEmbeds = (
+      article.contentHtml.includes('twitter.com') ||
+      article.contentHtml.includes('x.com') ||
+      article.contentHtml.includes('instagram.com') ||
+      article.contentHtml.includes('facebook.com')
+    );
+    if (!hasEmbeds) return;
 
     let attempts = 0;
     let isCancelled = false;

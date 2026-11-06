@@ -67,7 +67,7 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ r
       <main className="container" style={{ paddingTop: 24, paddingBottom: 60 }}>
         {featured ? (
           <section style={{ marginBottom: 40 }}>
-            <Link href={getArticleUrl(featured.slug)} className="card responsive-featured-grid" style={{ padding: 0, overflow: "hidden", minHeight: 400 }}>
+            <Link href={getArticleUrl(featured.slug)} prefetch={false} className="card responsive-featured-grid" style={{ padding: 0, overflow: "hidden", minHeight: 400 }}>
               <div style={{
                 position: "relative",
                 minHeight: 300,
@@ -121,6 +121,7 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ r
                   <Link
                     key={r.slug}
                     href={getArticleUrl(r.slug)}
+                    prefetch={false}
                     style={{
                       display: "block", padding: "16px 20px",
                       borderBottom: i === data.recent.length - 1 ? "none" : "1px solid #F3F4F6",

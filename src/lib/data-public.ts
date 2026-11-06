@@ -190,11 +190,19 @@ async function populateArticles(docs: any[]) {
     };
   });
 }
+let cachedCategories: { data: any[]; timestamp: number } | null = null;
+
 export async function getAllCategories() {
+  const now = Date.now();
+  if (cachedCategories && now - cachedCategories.timestamp < 5 * 60 * 1000) {
+    return cachedCategories.data;
+  }
   const snapshot = await db.collection("categories").orderBy("name", "asc").get();
-  return snapshot.docs.map(doc => ({
+  const data = snapshot.docs.map(doc => ({
     id: doc.id,
     name: doc.data().name,
     slug: doc.data().slug
   }));
+  cachedCategories = { data, timestamp: now };
+  return data;
 }

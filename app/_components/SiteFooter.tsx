@@ -156,6 +156,7 @@ export default function SiteFooter({
                 <Link
                   key={post.id}
                   href={getLinkUrl(`/article/${post.slug}`)}
+                  prefetch={false}
                   style={{ display: "flex", gap: 12, alignItems: "start" }}
                 >
                   <div

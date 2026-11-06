@@ -31,7 +31,7 @@ export default function ArticleCard({ a }: { a: any }) {
   const articleUrl = getAbsoluteUrl(getUrl(a.slug));
 
   return (
-    <Link href={getUrl(a.slug)} className="card" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+    <Link href={getUrl(a.slug)} prefetch={false} className="card" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
       <div style={{
         width: "100%",
         aspectRatio: "16/9",
